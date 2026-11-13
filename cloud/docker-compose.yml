@@ -1,0 +1,58 @@
+# ==============================================================================
+# Portal em Nuvem (VPS) - API de ingestão + PostgreSQL central
+# Pressupõe um Traefik já em execução na VPS, conectado à rede externa ${TRAEFIK_NETWORK}.
+# O Postgres fica apenas na rede interna (sem porta publicada).
+# ==============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: monitor-mesas-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: monitor_mesas
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+      TZ: America/Sao_Paulo
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor -d monitor_mesas"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - interna
+
+  api:
+    build: ./api
+    container_name: monitor-mesas-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://monitor:${POSTGRES_PASSWORD}@postgres:5432/monitor_mesas
+      TZ: America/Sao_Paulo
+    networks:
+      - interna
+      - traefik
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK:-traefik}
+      - traefik.http.routers.monitor-api.rule=Host(`${API_DOMAIN:?defina API_DOMAIN no .env}`)
+      - traefik.http.routers.monitor-api.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
+      - traefik.http.routers.monitor-api.tls=true
+      - traefik.http.routers.monitor-api.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      - traefik.http.routers.monitor-api.middlewares=monitor-api-limite
+      - traefik.http.middlewares.monitor-api-limite.buffering.maxRequestBodyBytes=5242880
+      - traefik.http.services.monitor-api.loadbalancer.server.port=8000
+
+volumes:
+  pgdata:
+
+networks:
+  interna:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik}

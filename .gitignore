@@ -1,0 +1,85 @@
+# ==============================================================================
+# .gitignore — Monitoramento de Mesas com IA
+# Regra geral: nada de segredos, dados de operação ou imagens de pessoas (LGPD)
+# vai para o repositório. Modelos de configuração ficam em *.example.
+# ==============================================================================
+
+# ---------- Segredos e credenciais ----------
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+.streamlit/secrets.toml
+**/secrets.toml
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+client_secret*.json
+credentials*.json
+service-account*.json
+
+# ---------- Dados de operação do restaurante (gerados em runtime) ----------
+# Inclui URLs RTSP com usuário/senha (cameras_config.json), histórico SQLite,
+# logs de alertas, estado ao vivo e cursor do Edge Sync.
+data/*
+!data/.gitkeep
+
+# Bancos SQLite em qualquer lugar (inclui arquivos WAL/SHM)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Backups de banco
+*.sql.gz
+*.dump
+backup_*.sql
+
+# ---------- Imagens e vídeos (podem conter pessoas — LGPD) ----------
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.jpg
+*.jpeg
+*.png
+
+# ---------- Pesos de modelos de IA (grandes; baixados separadamente) ----------
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# ---------- Python ----------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- Saídas locais de testes / execuções ----------
+runs/
+output/
+*.log
+*.tmp
+
+# ---------- Ferramentas e editores ----------
+.vscode/
+.idea/
+.claude/settings.local.json
+
+# ---------- Sistema operacional ----------
+.DS_Store
+Thumbs.db
+desktop.ini

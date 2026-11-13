@@ -1,0 +1,80 @@
+services:
+  # ============================================================================
+  # Serviço 1: Dashboard Web Gerencial (Streamlit)
+  # Interface visual do salão, fila de alertas e ajuste de tempos
+  # ============================================================================
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: monitor-mesas-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=America/Sao_Paulo
+    command: ["streamlit", "run", "src/dashboard.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--server.maxUploadSize=500"]
+    networks:
+      - rede-monitoramento
+
+  # ============================================================================
+  # Serviço 2: Motor de Estados e Cronômetros em Background
+  # Processamento contínuo das câmeras RTSP e gravação de logs
+  # ============================================================================
+  motor-estados:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: monitor-mesas-engine
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=America/Sao_Paulo
+    command: ["python", "src/motor_estados.py", "--loop"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os, time; assert time.time() - os.path.getmtime('/app/data/estado_atual.json') < 45\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - rede-monitoramento
+
+  # ============================================================================
+  # Serviço 3: Edge Sync (envio do histórico anônimo para o portal em nuvem)
+  # Envia apenas metadados (eventos/visitas/amostras); nenhuma imagem sai do local.
+  # Configure CLOUD_API_URL e EDGE_TOKEN no arquivo .env ao lado deste compose.
+  # Sem configuração, o serviço fica ocioso e a operação local segue normalmente.
+  # ============================================================================
+  edge-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: monitor-mesas-edge-sync
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=America/Sao_Paulo
+      - CLOUD_API_URL=${CLOUD_API_URL:-}
+      - EDGE_TOKEN=${EDGE_TOKEN:-}
+      - SYNC_INTERVALO_SEG=${SYNC_INTERVALO_SEG:-60}
+    command: ["python", "src/edge_sync.py"]
+    healthcheck:
+      disable: true
+    networks:
+      - rede-monitoramento
+
+networks:
+  rede-monitoramento:
+    driver: bridge
+
