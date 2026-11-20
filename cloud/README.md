@@ -37,7 +37,11 @@ docker compose exec api python -m app.admin listar                 # restaurante
 docker compose exec api python -m app.admin novo-token 3           # rotaciona token (o antigo para de valer; não reativa)
 docker compose exec api python -m app.admin desativar 3            # bloqueia a ingestão do restaurante
 docker compose exec api python -m app.admin reativar 3             # volta a aceitar a ingestão
-docker compose exec api python -m app.admin adicionar-usuario dono@gmail.com gerente --estabelecimento 3
+docker compose exec api python -m app.admin definir-fuso 3 America/Manaus   # fuso da loja (relatórios)
+docker compose exec api python -m app.admin vincular dono@gmail.com 5       # dono com várias lojas
+docker compose exec api python -m app.admin desvincular dono@gmail.com 5
+docker compose exec api python -m app.admin criar-login-portal              # login Postgres SOMENTE LEITURA do portal
+docker compose exec api python -m app.admin adicionar-usuario dono@gmail.com gerente --estabelecimento 3 4
 docker compose exec api python -m app.admin adicionar-usuario voce@gmail.com admin
 docker compose exec api python -m app.admin remover-usuario dono@gmail.com
 ```
