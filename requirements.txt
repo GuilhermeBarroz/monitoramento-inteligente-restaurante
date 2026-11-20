@@ -2,5 +2,9 @@ ultralytics>=8.3.0
 opencv-python>=4.10.0
 shapely>=2.0.0
 numpy>=1.26.0
-streamlit>=1.35.0
+# st.context.ip_address, componentes v2 e AppTest usados no painel: testado na 1.67
+streamlit>=1.67.0
+pandas>=2.0.0
+# Base de fusos horários (America/Sao_Paulo) para Windows e imagens Docker slim
+tzdata>=2024.1
 

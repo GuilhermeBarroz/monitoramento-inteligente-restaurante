@@ -43,6 +43,7 @@ from config_cameras import (
 )
 from zone_editor_component import renderizar_editor_zonas
 from io_atomico import escrever_json_atomico
+from util_painel import LINHAS_EXIBIDAS_TABELA, csv_seguro, fmt_pct, na_faixa
 from acesso_local import (
     LimitadorTentativas,
     encerrar_sessao_admin,
@@ -107,6 +108,7 @@ def carregar_regras() -> dict:
 
 def salvar_regras(regras: dict):
     escrever_json_atomico(CONFIG_REGRAS_PATH, regras, duravel=True)
+
 
 def carregar_mesas(mesas_path: Path = CONFIG_MESAS_PATH) -> list:
     if Path(mesas_path).exists():
@@ -198,7 +200,7 @@ def _renderizar_regras_sidebar():
     novo_limite_espera = st.sidebar.slider(
         "⏱️ Tempo Limite de Espera (Garçom)",
         min_value=0.5, max_value=15.0,
-        value=float(regras.get("limite_espera_garcom_minutos", 5.0)),
+        value=na_faixa(regras, "limite_espera_garcom_minutos", 5.0, 0.5, 15.0),
         step=0.5,
         help="Tempo máximo (em minutos) que um cliente pode aguardar atendimento."
     )
@@ -206,7 +208,7 @@ def _renderizar_regras_sidebar():
     novo_limite_cozinha = st.sidebar.slider(
         "🍳 Tempo Limite de Cozinha / Entrega",
         min_value=5.0, max_value=45.0,
-        value=float(regras.get("limite_cozinha_minutos", 20.0)),
+        value=na_faixa(regras, "limite_cozinha_minutos", 20.0, 5.0, 45.0),
         step=1.0,
         help="Tempo máximo (em minutos) entre pedido e entrega na mesa."
     )
@@ -214,7 +216,7 @@ def _renderizar_regras_sidebar():
     novo_limite_limpeza = st.sidebar.slider(
         "🧹 Tempo Limite de Limpeza (Giro)",
         min_value=1.0, max_value=10.0,
-        value=float(regras.get("limite_limpeza_minutos", 3.0)),
+        value=na_faixa(regras, "limite_limpeza_minutos", 3.0, 1.0, 10.0),
         step=0.5,
         help="Tempo máximo (em minutos) para higienizar uma mesa vazia."
     )
@@ -230,14 +232,14 @@ def _renderizar_regras_sidebar():
         visita_min_seg = st.number_input(
             "Tempo mín. visita de garçom (s)",
             min_value=1.0, max_value=30.0,
-            value=float(regras.get("visita_min_segundos", 4.0)),
+            value=na_faixa(regras, "visita_min_segundos", 4.0, 1.0, 30.0),
             step=0.5,
             help="Filtra passantes rápidos no corredor.",
         )
         limpeza_min_seg = st.number_input(
             "Tempo mín. visita de limpeza (s)",
             min_value=1.0, max_value=30.0,
-            value=float(regras.get("limpeza_min_segundos", 5.0)),
+            value=na_faixa(regras, "limpeza_min_segundos", 5.0, 1.0, 30.0),
             step=0.5,
             help="Tempo breve de higienização na mesa vazia antes de liberá-la.",
         )
@@ -253,14 +255,14 @@ def _renderizar_regras_sidebar():
         uniforme_margem = st.slider(
             "Margem ao redor da mesa (px)",
             min_value=0, max_value=80,
-            value=int(regras.get("uniforme_margem_px", 35)),
+            value=na_faixa(regras, "uniforme_margem_px", 35, 0, 80, int),
             step=5,
             disabled=not uniforme_ativo,
         )
         uniforme_ratio = st.slider(
             "Sensibilidade cor uniforme (%)",
             min_value=10, max_value=60,
-            value=int(round(float(regras.get("uniforme_ratio_min", 0.25)) * 100)),
+            value=int(round(na_faixa(regras, "uniforme_ratio_min", 0.25, 0.10, 0.60) * 100)),
             step=5,
             disabled=not uniforme_ativo,
         ) / 100.0
@@ -270,7 +272,7 @@ def _renderizar_regras_sidebar():
             "Permanência padrão inicial (min)",
             min_value=15.0,
             max_value=120.0,
-            value=float(regras.get("permanencia_padrao_minutos", 45.0)),
+            value=na_faixa(regras, "permanencia_padrao_minutos", 45.0, 15.0, 120.0),
             step=5.0,
             help="Usado para prever liberação de mesas antes de completar 3 visitas reais na mesa.",
         )
@@ -278,7 +280,7 @@ def _renderizar_regras_sidebar():
             "Mesas por garçom (escala)",
             min_value=1,
             max_value=12,
-            value=int(regras.get("mesas_por_garcom", 4)),
+            value=na_faixa(regras, "mesas_por_garcom", 4, 1, 12, int),
             step=1,
             help="Base usada para recomendar quantidade de garçons nos horários de pico.",
         )
@@ -752,7 +754,7 @@ def _renderizar_pico_e_escala(repo: RepositorioAnalytics, dias: Optional[int], c
         piv = piv.reindex(ordem_dias).fillna(0.0)
         st.dataframe(piv, width="stretch")
 
-        csv_bytes = df_m.to_csv(index=False).encode("utf-8-sig")
+        csv_bytes = csv_seguro(df_m)
         st.download_button(
             "📥 Baixar Relatório Completo de Pico e Escala (CSV)",
             data=csv_bytes,
@@ -778,7 +780,7 @@ def _gerar_relatorio_html(
         f"<td>{item['espera_mediana_min'] if item['espera_mediana_min'] is not None else '-'}</td>"
         f"<td>{item['limpeza_mediana_min'] if item['limpeza_mediana_min'] is not None else '-'}</td>"
         f"<td>{item['alertas']}</td>"
-        f"<td>{item['sla_ok_pct']:.1f}%</td></tr>"
+        f"<td>{fmt_pct(item['sla_ok_pct'])}</td></tr>"
         for item in desempenho
     ) or "<tr><td colspan='8'>Sem dados no período selecionado.</td></tr>"
 
@@ -810,7 +812,7 @@ def _gerar_relatorio_html(
   <div class="meta">Período: <strong>{html.escape(periodo_label)}</strong> | Filtro: <strong>{html.escape(camera_label)}</strong></div>
   <div class="kpis">
     <div class="card">Visitas Concluídas<strong>{resumo['total_visitas']}</strong></div>
-    <div class="card">SLA Dentro da Meta<strong>{resumo.get('sla_sem_alerta_pct', 100.0):.1f}%</strong></div>
+    <div class="card">SLA Atendimento / Limpeza<strong>{fmt_pct(resumo.get('sla_sem_alerta_pct'))} / {fmt_pct(resumo.get('sla_limpeza_pct'))}</strong></div>
     <div class="card">Permanência Mediana / P90<strong>{resumo['permanencia_mediana_min']:.1f} min / {resumo['permanencia_p90_min']:.1f} min</strong></div>
     <div class="card">Espera Mediana Garçom<strong>{resumo['espera_mediana_min'] if resumo['espera_mediana_min'] is not None else '-'} min</strong></div>
     <div class="card">Limpeza Mediana<strong>{resumo.get('limpeza_mediana_min') if resumo.get('limpeza_mediana_min') is not None else '-'} min</strong></div>
@@ -850,7 +852,7 @@ def _renderizar_desempenho_e_sla(
                 "Espera Garçom (min)": d["espera_mediana_min"],
                 "Limpeza (min)": d["limpeza_mediana_min"],
                 "Alertas": d["alertas"],
-                "SLA OK (%)": float(d["sla_ok_pct"]),
+                "SLA OK (%)": float(d["sla_ok_pct"]) if d["sla_ok_pct"] is not None else None,
             }
             for d in desempenho
         ])
@@ -869,7 +871,7 @@ def _renderizar_desempenho_e_sla(
         c_dl1, c_dl2 = st.columns(2)
         c_dl1.download_button(
             "📥 Baixar Desempenho por Mesa (CSV)",
-            data=df_des.to_csv(index=False).encode("utf-8-sig"),
+            data=csv_seguro(df_des),
             file_name="relatorio_desempenho_mesas.csv",
             mime="text/csv",
             key="dl_mesas_csv",
@@ -914,8 +916,10 @@ def _renderizar_extrato_visitas_e_alertas(visitas_det: list, rel_alertas: dict):
             }
             for v in visitas_det
         ])
+        if len(df_v) > LINHAS_EXIBIDAS_TABELA:
+            st.caption(f"Exibindo as {LINHAS_EXIBIDAS_TABELA} visitas mais recentes de {len(df_v)}. O CSV traz o período completo.")
         st.dataframe(
-            df_v,
+            df_v.head(LINHAS_EXIBIDAS_TABELA),
             width="stretch",
             hide_index=True,
             column_config={
@@ -926,7 +930,7 @@ def _renderizar_extrato_visitas_e_alertas(visitas_det: list, rel_alertas: dict):
         )
         st.download_button(
             "📥 Baixar Extrato de Visitas (CSV)",
-            data=df_v.to_csv(index=False).encode("utf-8-sig"),
+            data=csv_seguro(df_v),
             file_name="relatorio_visitas.csv",
             mime="text/csv",
             key="dl_visitas_csv",
@@ -948,10 +952,12 @@ def _renderizar_extrato_visitas_e_alertas(visitas_det: list, rel_alertas: dict):
             }
             for a in lista_al
         ])
-        st.dataframe(df_al, width="stretch", hide_index=True)
+        if len(df_al) > LINHAS_EXIBIDAS_TABELA:
+            st.caption(f"Exibindo os {LINHAS_EXIBIDAS_TABELA} alertas mais recentes de {len(df_al)}. O CSV traz o período completo.")
+        st.dataframe(df_al.head(LINHAS_EXIBIDAS_TABELA), width="stretch", hide_index=True)
         st.download_button(
             "📥 Baixar Log de Alertas (CSV)",
-            data=df_al.to_csv(index=False).encode("utf-8-sig"),
+            data=csv_seguro(df_al),
             file_name="relatorio_alertas.csv",
             mime="text/csv",
             key="dl_alertas_csv",
@@ -970,7 +976,8 @@ def renderizar_relatorios_etapa2():
     regras_atual = carregar_regras()
 
     c_per, c_cam, c_ratio, c_btn = st.columns([1.2, 1.4, 1.0, 0.8])
-    periodos = {"Hoje (24h)": 1, "Últimos 7 dias": 7, "Últimos 30 dias": 30, "Todo o histórico": None}
+    # "Últimas 24h" (janela móvel), não "Hoje": o filtro é agora − 24h, não o dia do calendário
+    periodos = {"Últimas 24h": 1, "Últimos 7 dias": 7, "Últimos 30 dias": 30, "Todo o histórico": None}
     per_label = c_per.selectbox("Período de análise:", list(periodos.keys()), index=2, key="ana_periodo")
     dias_filtro = periodos[per_label]
 
@@ -983,7 +990,7 @@ def renderizar_relatorios_etapa2():
             "Mesas / garçom:",
             min_value=1,
             max_value=12,
-            value=int(regras_atual.get("mesas_por_garcom", 4)),
+            value=na_faixa(regras_atual, "mesas_por_garcom", 4, 1, 12, int),
             step=1,
             key="ana_ratio_garcom",
         )
@@ -997,12 +1004,16 @@ def renderizar_relatorios_etapa2():
     desempenho = repo.consultar_desempenho_por_mesa(dias=dias_filtro, camera_id=cam_sel)
     medianas_hist = repo.consultar_medianas_detalhadas(dias=dias_filtro, camera_id=cam_sel)
     turnos = repo.consultar_ranking_turnos(dias=dias_filtro, camera_id=cam_sel, mesas_por_garcom=ratio_val)
-    visitas_det = repo.consultar_visitas_detalhadas(dias=dias_filtro, camera_id=cam_sel)
-    rel_alertas = repo.consultar_relatorio_alertas(dias=dias_filtro, camera_id=cam_sel)
+    visitas_det = repo.consultar_visitas_detalhadas(dias=dias_filtro, camera_id=cam_sel, limite=None)
+    rel_alertas = repo.consultar_relatorio_alertas(dias=dias_filtro, camera_id=cam_sel, limite=None)
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Visitas / Giros", f"{resumo['total_visitas']}")
-    k2.metric("SLA Sem Atraso", f"{resumo.get('sla_sem_alerta_pct', 100.0):.1f}%")
+    k2.metric(
+        "SLA Atendimento",
+        fmt_pct(resumo.get("sla_sem_alerta_pct")),
+        help="Visitas sem alerta de espera do garçom nem de atraso da cozinha.",
+    )
     k3.metric(
         "Permanência Mediana",
         f"{resumo['permanencia_mediana_min']:.1f} min" if resumo["total_visitas"] else "-",
@@ -1016,6 +1027,9 @@ def renderizar_relatorios_etapa2():
     k5.metric(
         "Limpeza Mediana",
         f"{resumo['limpeza_mediana_min']:.1f} min" if resumo.get("limpeza_mediana_min") is not None else "-",
+        delta=f"SLA limpeza: {fmt_pct(resumo.get('sla_limpeza_pct'))}" if resumo.get("sla_limpeza_pct") is not None else None,
+        delta_color="off",
+        help="SLA de limpeza: mesas higienizadas sem alerta de mesa suja.",
     )
     k6.metric("Alertas no Período", f"{resumo['total_alertas']}")
 

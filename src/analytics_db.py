@@ -35,10 +35,18 @@ TURNOS_PADRAO = [
 ]
 
 
+_TZ_FALLBACK_AVISADO = set()
+
+
 def _resolver_tz(timezone_nome: str = TIMEZONE_PADRAO):
     try:
         return zoneinfo.ZoneInfo(timezone_nome)
-    except Exception:
+    except Exception as e:
+        # Sem a base de fusos (pacote tzdata no Windows/imagens slim), dia/hora dos
+        # relatórios sairiam no fuso do sistema. Avisa uma vez em vez de falhar calado.
+        if timezone_nome not in _TZ_FALLBACK_AVISADO:
+            _TZ_FALLBACK_AVISADO.add(timezone_nome)
+            print(f"⚠️ Fuso '{timezone_nome}' indisponível ({e}); usando o fuso do sistema. Instale o pacote 'tzdata'.")
         return datetime.now().astimezone().tzinfo
 
 
@@ -75,6 +83,24 @@ def _percentil(valores_ordenados: List[float], p: float) -> float:
         return float(valores_ordenados[idx_inf])
     frac = pos - idx_inf
     return float(valores_ordenados[idx_inf] * (1.0 - frac) + valores_ordenados[idx_sup] * frac)
+
+
+def _tipo_alerta(detalhes_json: Optional[str]) -> str:
+    """Tipo do alerta a partir do JSON do evento; 'ALERTA' se ausente, nulo ou inválido."""
+    try:
+        det = json.loads(detalhes_json or "{}")
+    except Exception:
+        return "ALERTA"
+    valor = det.get("alerta") if isinstance(det, dict) else None
+    return str(valor) if valor else "ALERTA"
+
+
+def _media_ponderada_por_amostras(itens: List[dict]) -> float:
+    """Média de ocupação ponderada pelo nº de amostras; células sem amostra não entram."""
+    peso = sum(int(i.get("amostras", 0)) for i in itens)
+    if peso <= 0:
+        return 0.0
+    return sum(i["ocupacao_media_mesas"] * int(i.get("amostras", 0)) for i in itens) / peso
 
 
 def _sugerir_garcons(mesas_ocupadas: float, mesas_por_garcom: int, minimo_se_ativo: bool = True) -> int:
@@ -151,6 +177,10 @@ class RepositorioAnalytics:
     def __init__(self, db_path: Path = DB_PATH_PADRAO, timezone_nome: str = TIMEZONE_PADRAO):
         self.db_path = Path(db_path)
         self.timezone_nome = timezone_nome
+        # Memoização da matriz de pico dentro da vida desta instância. O painel cria
+        # um repositório por renderização e pede a matriz várias vezes (hora, dia,
+        # turno, matriz): sem isso, as mesmas consultas pesadas rodavam ~5 vezes.
+        self._cache_matriz: Dict[Tuple[Optional[int], Optional[str], int], List[dict]] = {}
         self.inicializar_banco()
 
     @contextmanager
@@ -457,17 +487,37 @@ class RepositorioAnalytics:
         sem_atraso = sum(1 for v in visitas if int(v["houve_alerta"]) == 0)
 
         tempos_limpeza: List[float] = []
+        # SLA de limpeza (Métrica 3) por EPISÓDIO: cada MESA_HIGIENIZADA traz `com_alerta`
+        # (o alerta de mesa suja já tinha disparado naquela limpeza). O alerta dispara
+        # depois que a visita foi fechada, por isso não entra no `houve_alerta` da visita.
+        # Eventos antigos, sem o campo, ficam fora do SLA (não há como saber).
+        limpezas_avaliaveis = 0
+        limpezas_no_prazo = 0
         for lr in limpezas_rows:
             try:
                 det = json.loads(lr["detalhes_json"] or "{}")
-                if det.get("tempo_limpeza") is not None:
-                    tempos_limpeza.append(float(det["tempo_limpeza"]))
             except Exception:
-                pass
+                continue
+            if det.get("tempo_limpeza") is not None:
+                try:
+                    tempos_limpeza.append(float(det["tempo_limpeza"]))
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(det.get("com_alerta"), bool):
+                limpezas_avaliaveis += 1
+                if not det["com_alerta"]:
+                    limpezas_no_prazo += 1
 
+        total_limpezas = len(limpezas_rows)
         return {
             "total_visitas": len(visitas),
-            "sla_sem_alerta_pct": round((sem_atraso / len(visitas)) * 100.0, 1) if visitas else 100.0,
+            # SLA de atendimento (espera do garçom + cozinha). None sem visitas: não exibir "100%" sem dado.
+            "sla_sem_alerta_pct": round((sem_atraso / len(visitas)) * 100.0, 1) if visitas else None,
+            # SLA de limpeza: higienizações concluídas sem alerta de "mesa suja" naquele episódio
+            "total_limpezas": total_limpezas,
+            "sla_limpeza_pct": round((limpezas_no_prazo / limpezas_avaliaveis) * 100.0, 1)
+            if limpezas_avaliaveis
+            else None,
             "permanencia_mediana_min": round(statistics.median(durs) / 60.0, 1) if durs else 0.0,
             "permanencia_p90_min": round(_percentil(durs, 0.90) / 60.0, 1) if durs else 0.0,
             "espera_mediana_min": round(statistics.median(esperas) / 60.0, 1) if esperas else None,
@@ -541,7 +591,7 @@ class RepositorioAnalytics:
                 "espera_mediana_min": round(statistics.median(g["esperas"]) / 60.0, 1) if g["esperas"] else None,
                 "limpeza_mediana_min": round(statistics.median(g["limpezas"]) / 60.0, 1) if g["limpezas"] else None,
                 "alertas": g["alertas"],
-                "sla_ok_pct": round((g["sem_alerta"] / n_vis) * 100.0, 1) if n_vis > 0 else 100.0,
+                "sla_ok_pct": round((g["sem_alerta"] / n_vis) * 100.0, 1) if n_vis > 0 else None,
             })
         return linhas
 
@@ -549,16 +599,21 @@ class RepositorioAnalytics:
         self,
         dias: Optional[int] = 30,
         camera_id: Optional[str] = None,
-        limite: int = 300,
+        limite: Optional[int] = 300,
     ) -> List[dict]:
-        """Lista extrato detalhado das visitas concluídas para conferência e exportação."""
+        """
+        Lista extrato detalhado das visitas concluídas. `limite=None` traz o período
+        inteiro (uso: exportação CSV, que não pode sair truncada).
+        """
         where_v, params_v = self._clausula_filtro("fim_epoch", dias, camera_id)
         query = (
             "SELECT camera_nome, mesa_id, inicio_epoch, fim_epoch, duracao_segundos, "
             "espera_garcom_segundos, tempo_preparo_segundos, qtd_pessoas, houve_alerta "
-            "FROM visitas_concluidas" + where_v + " ORDER BY fim_epoch DESC LIMIT ?"
+            "FROM visitas_concluidas" + where_v + " ORDER BY fim_epoch DESC"
         )
-        params_v.append(int(limite))
+        if limite is not None:
+            query += " LIMIT ?"
+            params_v.append(int(limite))
         with self._conectar() as conn:
             rows = conn.execute(query, params_v).fetchall()
 
@@ -587,27 +642,43 @@ class RepositorioAnalytics:
         self,
         dias: Optional[int] = 30,
         camera_id: Optional[str] = None,
-        limite: int = 300,
+        limite: Optional[int] = 300,
     ) -> dict:
-        """Retorna resumo agrupado por tipo de alerta e listagem detalhada das ocorrências."""
+        """
+        Resumo por tipo de alerta (sempre sobre o PERÍODO INTEIRO, coerente com o
+        total de alertas) e listagem das ocorrências (`limite=None` = todas).
+        """
         where_e, params_e = self._clausula_filtro("epoch", dias, camera_id)
+        filtro_tipo = where_e + " AND tipo_evento = ?" if where_e else " WHERE tipo_evento = ?"
         sql = (
             "SELECT iso_datahora, camera_nome, mesa_id, detalhes_json FROM eventos_mesas"
-            + (where_e + " AND tipo_evento = ?" if where_e else " WHERE tipo_evento = ?")
-            + " ORDER BY epoch DESC LIMIT ?"
+            + filtro_tipo
+            + " ORDER BY epoch DESC"
         )
+        params_lista = params_e + ["ALERTA_DISPARADO"]
+        if limite is not None:
+            sql += " LIMIT ?"
+            params_lista.append(int(limite))
+        # Contagem por tipo sobre o período inteiro, em Python e tolerante a JSON
+        # inválido (json_extract no SQL falharia a consulta toda por uma linha ruim
+        # e não existe no Postgres do portal).
+        sql_todos = "SELECT detalhes_json FROM eventos_mesas" + filtro_tipo
         with self._conectar() as conn:
-            rows = conn.execute(sql, params_e + ["ALERTA_DISPARADO", int(limite)]).fetchall()
+            rows = conn.execute(sql, params_lista).fetchall()
+            todos = conn.execute(sql_todos, params_e + ["ALERTA_DISPARADO"]).fetchall()
 
         por_tipo: Dict[str, int] = {}
+        for r in todos:
+            tipo = _tipo_alerta(r["detalhes_json"])
+            por_tipo[tipo] = por_tipo.get(tipo, 0) + 1
+
         alertas: List[dict] = []
         for r in rows:
             try:
                 det = json.loads(r["detalhes_json"] or "{}")
             except Exception:
                 det = {}
-            tipo_alerta = str(det.get("alerta", "ALERTA"))
-            por_tipo[tipo_alerta] = por_tipo.get(tipo_alerta, 0) + 1
+            tipo_alerta = _tipo_alerta(r["detalhes_json"])
 
             tempo_seg = det.get("tempo_espera") or det.get("tempo_cozinha") or det.get("tempo_espera_limpeza")
             alertas.append({
@@ -668,6 +739,19 @@ class RepositorioAnalytics:
         """
         Retorna matriz `(dia_semana, hora)` combinando amostras de ocupação, visitas iniciadas e alertas.
         """
+        chave_cache = (dias, camera_id, int(mesas_por_garcom))
+        if chave_cache in self._cache_matriz:
+            return [dict(item) for item in self._cache_matriz[chave_cache]]
+        matriz = self._calcular_matriz_pico_hora_dia(dias, camera_id, mesas_por_garcom)
+        self._cache_matriz[chave_cache] = matriz
+        return [dict(item) for item in matriz]
+
+    def _calcular_matriz_pico_hora_dia(
+        self,
+        dias: Optional[int],
+        camera_id: Optional[str],
+        mesas_por_garcom: int,
+    ) -> List[dict]:
         where_a, params_a = self._clausula_filtro("epoch", dias, camera_id)
         where_v, params_v = self._clausula_filtro("fim_epoch", dias, camera_id)
         where_e, params_e = self._clausula_filtro("epoch", dias, camera_id)
@@ -735,8 +819,11 @@ class RepositorioAnalytics:
                     pes_media = sum(x["pessoas"] for x in lista_am) / len(lista_am)
                     taxa_pct = (oc_media / tot_media * 100.0) if tot_media > 0 else 0.0
                 else:
-                    oc_media = float(len(lista_vis))
-                    oc_pico = len(lista_vis)
+                    # Sem amostras de ocupação nesta hora: NÃO há como saber quantas mesas
+                    # estavam ocupadas ao mesmo tempo. Antes o total de visitas do período
+                    # inteiro era usado como "mesas ocupadas", inflando ocupação e escala.
+                    oc_media = 0.0
+                    oc_pico = 0
                     pes_media = 0.0
                     taxa_pct = 0.0
 
@@ -786,8 +873,7 @@ class RepositorioAnalytics:
                 })
                 continue
 
-            total_peso = sum(max(1, i["amostras"]) for i in itens)
-            oc_media = sum(i["ocupacao_media_mesas"] * max(1, i["amostras"]) for i in itens) / total_peso
+            oc_media = _media_ponderada_por_amostras(itens)
             oc_pico = max(i["ocupacao_pico_mesas"] for i in itens)
             giros = sum(i["giros_visitas"] for i in itens)
             alertas = sum(i["alertas_disparados"] for i in itens)
@@ -829,8 +915,7 @@ class RepositorioAnalytics:
                 })
                 continue
 
-            total_peso = sum(max(1, i["amostras"]) for i in itens)
-            oc_media = sum(i["ocupacao_media_mesas"] * max(1, i["amostras"]) for i in itens) / total_peso
+            oc_media = _media_ponderada_por_amostras(itens)
             oc_pico = max(i["ocupacao_pico_mesas"] for i in itens)
             linhas.append({
                 "dia_semana": d,

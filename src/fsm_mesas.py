@@ -247,6 +247,7 @@ class MesaFSM:
         elif self.estado == EstadoMesa.PENDENTE_LIMPEZA:
             if funcionario_presente:
                 tempo_limpeza = self.tempo_decorrido_estado
+                limpeza_com_alerta = TipoAlerta.MESA_SUJA in self.alertas_ativos
                 self._limpar_auxiliares()
                 self.alertas_ativos.clear()
                 self._transicionar(EstadoMesa.LIVRE, t)
@@ -254,6 +255,7 @@ class MesaFSM:
                     "tipo": "MESA_HIGIENIZADA",
                     "mesa_id": self.mesa_id,
                     "tempo_limpeza": round(tempo_limpeza, 1),
+                    "com_alerta": bool(limpeza_com_alerta),
                     "timestamp": t,
                 })
             elif tem_clientes:
@@ -280,6 +282,7 @@ class MesaFSM:
                     self._limpeza_visita_ultimo = None
                     if dur_visita >= self.limpeza_min_segundos:
                         tempo_limpeza = self.tempo_decorrido_estado
+                        limpeza_com_alerta = TipoAlerta.MESA_SUJA in self.alertas_ativos
                         self._limpar_auxiliares()
                         self.alertas_ativos.clear()
                         self._transicionar(EstadoMesa.LIVRE, t)
@@ -287,6 +290,7 @@ class MesaFSM:
                             "tipo": "MESA_HIGIENIZADA",
                             "mesa_id": self.mesa_id,
                             "tempo_limpeza": round(tempo_limpeza, 1),
+                            "com_alerta": bool(limpeza_com_alerta),
                             "timestamp": t,
                         })
                         return novos_eventos
