@@ -48,6 +48,45 @@ services:
       - traefik.http.middlewares.monitor-api-limite.buffering.maxRequestBodyBytes=5242880
       - traefik.http.services.monitor-api.loadbalancer.server.port=8000
 
+  # Portal de relatórios (Streamlit + login Google). Conecta com o login Postgres
+  # SOMENTE LEITURA criado por `python -m app.admin criar-login-portal`.
+  portal:
+    build: ./portal
+    container_name: monitor-mesas-portal
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORTAL_DATABASE_URL: postgresql://${PORTAL_DB_USER:-portal}:${PORTAL_DB_PASSWORD:-}@postgres:5432/monitor_mesas
+      PORTAL_URL: https://${PORTAL_DOMAIN:-portal.invalid}
+      PORTAL_COOKIE_SECRET: ${PORTAL_COOKIE_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      TZ: America/Sao_Paulo
+    networks:
+      - interna
+      - traefik
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK:-traefik}
+      - traefik.http.routers.monitor-portal.rule=Host(`${PORTAL_DOMAIN:-portal.invalid}`)
+      - traefik.http.routers.monitor-portal.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
+      - traefik.http.routers.monitor-portal.tls=true
+      - traefik.http.routers.monitor-portal.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      - traefik.http.routers.monitor-portal.middlewares=monitor-portal-headers,monitor-portal-limite
+      # Limite por IP contra abuso (recargas em massa / logins de contas fora da allowlist)
+      - traefik.http.middlewares.monitor-portal-limite.ratelimit.average=20
+      - traefik.http.middlewares.monitor-portal-limite.ratelimit.burst=60
+      - traefik.http.middlewares.monitor-portal-headers.headers.stsSeconds=31536000
+      - traefik.http.middlewares.monitor-portal-headers.headers.stsIncludeSubdomains=true
+      - traefik.http.middlewares.monitor-portal-headers.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.monitor-portal-headers.headers.customFrameOptionsValue=SAMEORIGIN
+      - traefik.http.middlewares.monitor-portal-headers.headers.referrerPolicy=strict-origin-when-cross-origin
+      - traefik.http.middlewares.monitor-portal-headers.headers.permissionsPolicy=camera=(), microphone=(), geolocation=()
+      # Sem CSP de propósito: o Streamlit depende de script/estilo inline
+      - traefik.http.services.monitor-portal.loadbalancer.server.port=8501
+
 volumes:
   pgdata:
 

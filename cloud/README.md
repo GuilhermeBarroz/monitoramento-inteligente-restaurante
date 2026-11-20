@@ -1,9 +1,10 @@
 # ☁️ Portal em Nuvem — Deploy na VPS
 
-Recebe os metadados anônimos enviados pelo `edge-sync` de cada restaurante e os guarda em um PostgreSQL central multi-tenant. O portal de relatórios (Streamlit + login Google) vai ser adicionado a este mesmo compose na próxima etapa.
+Recebe os metadados anônimos enviados pelo `edge-sync` de cada restaurante, guarda tudo em um PostgreSQL central multi-tenant e serve o portal de relatórios (Streamlit + login Google).
 
 ```text
 Restaurante (edge-sync) ──HTTPS + token──▶ Traefik ──▶ api (FastAPI) ──▶ postgres (rede interna)
+Dono / gerente (navegador) ──HTTPS + Google──▶ Traefik ──▶ portal (Streamlit) ──▶ postgres (somente leitura)
 ```
 
 ## Pré-requisitos
@@ -44,6 +45,42 @@ docker compose exec api python -m app.admin criar-login-portal              # lo
 docker compose exec api python -m app.admin adicionar-usuario dono@gmail.com gerente --estabelecimento 3 4
 docker compose exec api python -m app.admin adicionar-usuario voce@gmail.com admin
 docker compose exec api python -m app.admin remover-usuario dono@gmail.com
+```
+
+## 4. Portal de relatórios (login Google)
+O dono/gerente acessa os relatórios de qualquer lugar em `https://<PORTAL_DOMAIN>`. Gerente vê **só as lojas vinculadas** a ele; admin escolhe qualquer loja e tem a aba **Saúde das Lojas** (último sync e último dado de ocupação de cada uma).
+
+1. **Credencial Google**: no Google Cloud Console → *APIs e serviços* → *Tela de consentimento OAuth* (tipo Externo, escopos `openid`, `email`, `profile`) → *Credenciais* → *ID do cliente OAuth* do tipo **Aplicativo da Web**, com URI de redirecionamento autorizado `https://<PORTAL_DOMAIN>/oauth2callback`.
+2. **DNS**: registro `A` de `PORTAL_DOMAIN` apontando para a VPS.
+3. **Login somente leitura do banco** (com a API já no ar):
+   ```bash
+   docker compose up -d postgres api
+   docker compose exec api python -m app.admin criar-login-portal   # mostra PORTAL_DB_PASSWORD uma única vez
+   ```
+4. Preencha no `.env`: `PORTAL_DOMAIN`, `PORTAL_DB_PASSWORD`, `PORTAL_COOKIE_SECRET` (gere com `python -c "import secrets; print(secrets.token_urlsafe(48))"`), `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET`.
+5. Autorize os e-mails e suba o portal:
+   ```bash
+   docker compose exec api python -m app.admin adicionar-usuario voce@gmail.com admin
+   docker compose exec api python -m app.admin adicionar-usuario dono@gmail.com gerente --estabelecimento 3
+   docker compose up -d --build portal
+   docker compose logs -f portal     # "Login Google configurado" e depois o Streamlit
+   ```
+   Se faltar alguma variável, o container para com `ERRO: configuração do login do portal inválida: ...` dizendo qual.
+
+Como funciona a segurança do portal:
+* Só entra conta Google com **e-mail verificado** que esteja **ativa** na tabela `usuarios`. O perfil é relido do banco a cada clique: `remover-usuario` ou `desvincular` valem na hora.
+* Toda consulta de relatório filtra por `estabelecimento_id` de uma loja já autorizada para aquele usuário, com SQL parametrizado. O cache (`st.cache_data`, 5 min) é chaveado pelo id da loja.
+* O portal usa o login Postgres `portal` (papel `portal_leitura`): só leitura nas tabelas de relatório, sem acesso ao hash dos tokens, e escrita apenas em `portal_acessos` (auditoria) e `usuarios.ultimo_login_em`.
+* Auditoria LGPD em `portal_acessos`: login, acesso negado, loja consultada, exportações e consulta da saúde das lojas.
+* O `secrets.toml` do login é gerado na subida do container a partir do `.env` (permissão 0600), nunca versionado nem embutido na imagem. Erros não mostram detalhes no navegador.
+* Exportações: CSV com proteção contra injeção de fórmula e relatório HTML imprimível com escape de todo texto. Cada exportação traz no máximo 50.000 linhas; acima disso o portal avisa para reduzir o período.
+
+Testes do portal:
+```bash
+cd cloud/portal && python -m unittest tests.test_portal -v             # sem banco (usa o .venv do projeto)
+# Integração com Postgres real (banco DESCARTÁVEL; precisa de psycopg + pandas):
+set TEST_DATABASE_URL=postgresql://postgres:teste@127.0.0.1:55432/postgres
+cd cloud/portal && python -m unittest tests.test_portal_postgres -v
 ```
 
 ## Segurança

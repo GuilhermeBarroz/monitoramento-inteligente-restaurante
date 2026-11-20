@@ -220,10 +220,10 @@ Para garantir que o cronômetro só seja encerrado na entrega real da comida, o 
 - [x] Esquema PostgreSQL com `estabelecimento_id` e tabela `usuarios` (perfis `admin` e `gerente`).
 - [x] CLI de administração: cadastrar restaurante, gerar/rotacionar token e autorizar e-mails.
 - [x] Compose da VPS integrado ao Traefik existente (HTTPS, limite de corpo de 5 MB, Postgres sem porta exposta).
-- [ ] Portal Streamlit com login Google (`st.login`/OIDC) restrito à allowlist da tabela `usuarios`.
-- [ ] Relatórios do portal portados para Postgres, com agregação no banco e `st.cache_data`. O admin escolhe o restaurante; o gerente vê apenas o seu.
-- [ ] Painel de saúde dos restaurantes (último sync de cada loja) para o admin.
-- [ ] Teste ponta a ponta com Postgres real e deploy na VPS.
+- [x] Portal Streamlit com login Google (`st.login`/OIDC) restrito à allowlist da tabela `usuarios`.
+- [x] Relatórios do portal portados para Postgres, com agregação no banco e `st.cache_data`. O admin escolhe o restaurante; o gerente vê apenas o seu.
+- [x] Painel de saúde dos restaurantes (último sync de cada loja) para o admin.
+- [ ] Teste ponta a ponta com Postgres real e deploy na VPS. (testes de integração do portal prontos em `cloud/portal/tests/test_portal_postgres.py`; falta executar e fazer o deploy)
 
 **Decisão (19/11/2026):** os **relatórios** ficam no portal em nuvem (acesso de qualquer lugar, todas as lojas); a **operação** (câmeras, calibração, painel ao vivo, alertas do salão) fica no Mini PC, acessível na rede local e pelo técnico via Tailscale. Imagens nunca passam pela nuvem.
 
