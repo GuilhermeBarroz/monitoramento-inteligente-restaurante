@@ -81,7 +81,50 @@ Motivos:
 
 ---
 
-## 4. Pendências de verificação (antes da decisão final)
+## 4. Comparação técnica: YOLOv10 × YOLOX
+
+| Aspecto | YOLOX (2021) | YOLOv10 (2024) |
+|---|---|---|
+| Arquitetura | Anchor-free, cabeça desacoplada, atribuição SimOTA | Anchor-free, blocos orientados a eficiência, atenção parcial, kernels grandes |
+| Pós-processamento | Usa **NMS** | **Sem NMS** (atribuição dupla consistente) |
+| Exportação | ONNX/OpenVINO/TensorRT maduros | ONNX/OpenVINO; ecossistema centrado no Ultralytics |
+| Licença | Apache 2.0 | AGPL-3.0 |
+
+Números publicados nos artigos (COCO val, valores aproximados citados de memória; conferir nos artigos originais):
+
+| Modelo | Parâmetros | GFLOPs | AP COCO |
+|---|---|---|---|
+| YOLOX-Nano (416 px) | 0,9 M | 1,1 | ~25,8 |
+| YOLOX-Tiny (416 px) | 5,1 M | 6,5 | ~32,8 |
+| YOLOv10-N | 2,3 M | 6,7 | ~38,5 |
+| YOLOX-S | 9,0 M | 26,8 | ~40,5 |
+| YOLOv10-S | 7,2 M | 21,6 | ~46,3 |
+| YOLOv10-B (usado hoje) | 19,1 M | 92 | ~52,5 |
+
+**Leitura para o nosso caso:**
+- Mesmo custo computacional, o YOLOv10 é ~6 pontos de AP mais preciso. O YOLOX é o mais antigo e menos preciso entre as alternativas livres.
+- O NMS custa < 1 ms em CPU com poucas pessoas: a vantagem "sem NMS" do YOLOv10 é irrelevante aqui.
+- O modelo atual (v10-B, 92 GFLOPs) é pesado demais para o N100 em qualquer cenário; a faixa adequada é N/S/Tiny.
+- O AP do COCO mede 80 classes; para "pessoa" todos ficam acima da média, e o debounce temporal da FSM absorve falhas isoladas. A diferença real aparece em **oclusão e pessoas pequenas/distantes**.
+
+## 5. Plano de teste comparativo (antes de decidir)
+
+Executar no Mini PC alvo (N100) com vídeos reais de restaurante:
+
+1. **Referência:** YOLOv10-N e YOLOv10-S.
+2. **Candidatos Apache 2.0:** YOLOX-Tiny/S; D-FINE-N/S e RF-DETR-Nano (transformers recentes, precisão no nível do YOLOv10, mais pesados em CPU — medir); detector de pessoas do OpenVINO (`person-detection-0200`, o mais leve).
+3. **Todos rodando via OpenVINO/ONNX Runtime**, sem o pacote `ultralytics`.
+4. **Métricas:**
+   - recall e falsos positivos de pessoas por zona de mesa, contra contagem manual em quadros amostrados;
+   - impacto na FSM (visitas fragmentadas, tempos medidos);
+   - tempo por quadro e câmeras simultâneas suportadas no N100.
+5. **Se o candidato livre ficar abaixo:** ajuste fino com algumas centenas de imagens rotuladas de restaurante (permitido pela Apache 2.0); para uma única classe costuma compensar a diferença.
+
+Encaixa na prioridade de desempenho (P6) do roteiro.
+
+---
+
+## 6. Pendências de verificação (antes da decisão final)
 - [ ] Ler o `LICENSE` oficial do repositório escolhido (YOLOX: [GitHub](https://github.com/Megvii-BaseDetection/YOLOX/blob/main/LICENSE)) e a licença dos **pesos** pré-treinados.
 - [ ] Confirmar a "Legal Information" do `person-detection-0200` na documentação do OpenVINO.
 - [ ] Confirmar a licença por tamanho do RF-DETR no repositório oficial, caso seja considerado.
