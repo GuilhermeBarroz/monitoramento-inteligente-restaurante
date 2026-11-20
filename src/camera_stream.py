@@ -32,24 +32,36 @@ class StreamCamera:
     Gerenciador resiliente de captura de vídeo com buffer zero-lag e auto-reconexão.
     Compatível com qualquer fabricante (Intelbras, Hikvision, Dahua, TP-Link, ONVIF e Webcams).
     """
+    # Timeouts do backend FFmpeg (abertura e leitura). Sem eles, um RTSP que para
+    # de responder pode bloquear `cap.read()` indefinidamente.
+    TIMEOUT_ABERTURA_MS = 8000
+    TIMEOUT_LEITURA_MS = 5000
+    # Sem frame NOVO por este tempo, a câmera é considerada desconectada
+    # (cobre stream congelado que continua "aberto").
+    TIMEOUT_FRAME_NOVO_S = 10.0
+    RECONEXAO_MAX_S = 60.0
+
     def __init__(self, fonte: Union[str, int] = "data/videos/sample_restaurante.mp4",
                  target_fps: float = 4.0,
                  reconnect_timeout: float = 5.0):
-        
+
         self.fonte_original = fonte
         self.fonte_sanitizada = self._sanitizar_fonte(fonte)
         self.target_fps = target_fps
         self.reconnect_timeout = reconnect_timeout
 
-        # Estado da thread
-        self.cap: Optional[cv2.VideoCapture] = None
+        # Estado da thread. O cv2.VideoCapture é local da thread de captura.
         self.running = False
+        self._parar_evento = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
 
-        # Buffer mais recente (apenas 1 frame)
+        # Buffer mais recente (apenas 1 frame) + controle de frescor
         self.ultimo_frame: Optional[np.ndarray] = None
         self.ultimo_status = False
+        self._seq_frame = 0            # incrementa a cada frame novo lido da fonte
+        self._seq_entregue = 0         # último frame entregue por ler_se_pronto()
+        self._ts_ultimo_frame = 0.0    # time.monotonic() do último frame novo
         self.total_frames_lidos = 0
         self.total_reconexoes = 0
         self.is_arquivo = isinstance(self.fonte_sanitizada, str) and Path(self.fonte_sanitizada).is_file()
@@ -93,98 +105,161 @@ class StreamCamera:
         return fonte_str
 
     def _fonte_mascarada(self) -> str:
+        """Fonte para logs, com a senha oculta. Nunca levanta exceção (porta inválida etc.)."""
         s = str(self.fonte_original)
-        parsed = urlparse(s)
-        if parsed.scheme in {"rtsp", "rtsps", "http", "https"} and parsed.password:
-            port = f":{parsed.port}" if parsed.port else ""
-            return urlunparse(parsed._replace(netloc=f"{parsed.username or ''}:****@{parsed.hostname or ''}{port}"))
-        return s
+        try:
+            parsed = urlparse(s)
+            if parsed.scheme in {"rtsp", "rtsps", "http", "https"} and parsed.password:
+                port = f":{parsed.port}" if parsed.port else ""
+                return urlunparse(parsed._replace(netloc=f"{parsed.username or ''}:****@{parsed.hostname or ''}{port}"))
+            return s
+        except ValueError:
+            return "<fonte com URL inválida>"
 
     def iniciar(self):
-        """Inicia a thread de captura contínua em segundo plano."""
+        """
+        Inicia a thread de captura em segundo plano. A conexão acontece dentro da
+        thread: uma câmera inacessível não trava quem chamou (o laço multi-câmera).
+        """
         if self.running:
             return
 
+        # Cada início ganha seu próprio evento de parada ("geração"). Uma thread de
+        # um início anterior que ainda esteja saindo (presa num open/read lento) só
+        # enxerga o próprio evento, que já está setado, e não interfere nesta.
         self.running = True
-        self._conectar()
-        self.thread = threading.Thread(target=self._loop_captura, daemon=True)
+        self._parar_evento = threading.Event()
+        self.thread = threading.Thread(target=self._loop_captura, args=(self._parar_evento,), daemon=True)
         self.thread.start()
-        print(f"📡 Stream conectado na fonte: {self._fonte_mascarada()} (Meta: {self.target_fps} FPS)")
+        print(f"📡 Stream iniciado na fonte: {self._fonte_mascarada()} (Meta: {self.target_fps} FPS)")
 
-    def _conectar(self) -> bool:
-        """Cria e configura o objeto cv2.VideoCapture com timeouts e buffer zerado."""
-        if self.cap is not None:
+    @staticmethod
+    def _liberar(cap: Optional[cv2.VideoCapture]) -> None:
+        if cap is not None:
             try:
-                self.cap.release()
+                cap.release()
             except Exception:
                 pass
 
-        if isinstance(self.fonte_sanitizada, str) and self.fonte_sanitizada.startswith("rtsp"):
-            # Otimizações de rede para câmeras de CFTV (TCP resiliente e buffer zerado)
-            self.cap = cv2.VideoCapture(self.fonte_sanitizada, cv2.CAP_FFMPEG)
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    def _abrir_captura(self) -> cv2.VideoCapture:
+        """Cria o cv2.VideoCapture com timeouts de abertura/leitura e buffer zerado."""
+        params = [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.TIMEOUT_ABERTURA_MS,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.TIMEOUT_LEITURA_MS,
+        ]
+        if isinstance(self.fonte_sanitizada, str) and not self.is_arquivo:
+            # RTSP/HTTP: backend FFmpeg (TCP via OPENCV_FFMPEG_CAPTURE_OPTIONS) com timeouts
+            cap = cv2.VideoCapture(self.fonte_sanitizada, cv2.CAP_FFMPEG, params)
         else:
-            self.cap = cv2.VideoCapture(self.fonte_sanitizada)
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap = cv2.VideoCapture(self.fonte_sanitizada)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
 
-        return self.cap.isOpened()
+    def _marcar_sem_sinal(self, parar: threading.Event):
+        with self.lock:
+            if parar is self._parar_evento:  # thread de geração antiga não mexe no estado
+                self.ultimo_status = False
 
-    def _loop_captura(self):
-        """Thread interna que drena continuamente o buffer de rede, retendo apenas o frame atual."""
+    def _loop_captura(self, parar: threading.Event):
+        """
+        Thread interna: conecta, drena o buffer retendo só o frame atual e reconecta
+        com backoff. O `cap` é LOCAL desta thread: só ela abre, lê e libera.
+        """
+        cap: Optional[cv2.VideoCapture] = None
         falhas_seguidas = 0
-        while self.running:
-            if self.cap is None or not self.cap.isOpened():
-                print(f"⚠️ Conexão perdida em {self._fonte_mascarada()}. Tentando reconectar em {self.reconnect_timeout}s...")
-                time.sleep(self.reconnect_timeout)
-                self.total_reconexoes += 1
-                if not self._conectar():
-                    continue
-                falhas_seguidas = 0
-                print(f"✅ Conexão restabelecida: {self._fonte_mascarada()}")
+        espera_reconexao = self.reconnect_timeout
+        primeira_conexao = True
+        try:
+            while not parar.is_set():
+                if cap is None or not cap.isOpened():
+                    if not primeira_conexao:
+                        self._marcar_sem_sinal(parar)
+                        print(f"⚠️ Conexão perdida em {self._fonte_mascarada()}. Tentando reconectar em {espera_reconexao:.0f}s...")
+                        if parar.wait(espera_reconexao):
+                            break
+                        self.total_reconexoes += 1
+                    self._liberar(cap)
+                    cap = self._abrir_captura()
+                    if parar.is_set():
+                        break
+                    if not cap.isOpened():
+                        if primeira_conexao:
+                            print(f"⚠️ Não foi possível abrir {self._fonte_mascarada()}. Nova tentativa em {espera_reconexao:.0f}s...")
+                        primeira_conexao = False
+                        espera_reconexao = min(espera_reconexao * 2, self.RECONEXAO_MAX_S)
+                        continue
+                    if not primeira_conexao:
+                        print(f"✅ Conexão restabelecida: {self._fonte_mascarada()}")
+                    primeira_conexao = False
+                    falhas_seguidas = 0
+                    espera_reconexao = self.reconnect_timeout
 
-            ret, frame = self.cap.read()
+                ret, frame = cap.read()
 
-            if ret:
-                falhas_seguidas = 0
-                with self.lock:
-                    self.ultimo_frame = frame
-                    self.ultimo_status = True
-                    self.total_frames_lidos += 1
-            else:
-                if self.is_arquivo:
-                    # Em caso de arquivo gravado de teste, reinicia o vídeo em loop contínuo
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                if ret and frame is not None:
+                    falhas_seguidas = 0
+                    with self.lock:
+                        if parar is not self._parar_evento:
+                            break  # geração antiga: não sobrescreve o frame da atual
+                        self.ultimo_frame = frame
+                        self.ultimo_status = True
+                        self._seq_frame += 1
+                        self._ts_ultimo_frame = time.monotonic()
+                        self.total_frames_lidos += 1
+                elif self.is_arquivo:
+                    # Arquivo de teste: reinicia o vídeo em loop contínuo
+                    falhas_seguidas += 1
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    if falhas_seguidas >= 30:  # arquivo ilegível: não gira a CPU sem parar
+                        self._marcar_sem_sinal(parar)
+                        if parar.wait(1.0):
+                            break
                 else:
                     falhas_seguidas += 1
-                    with self.lock:
-                        self.ultimo_status = False
-                    if falhas_seguidas >= 30 and self.cap is not None:
-                        self.cap.release()
-                        self.cap = None
+                    self._marcar_sem_sinal(parar)
+                    if falhas_seguidas >= 30:
+                        self._liberar(cap)
+                        cap = None
                         falhas_seguidas = 0
-                    time.sleep(0.1)
+                    if parar.wait(0.1):
+                        break
 
-            # Previne consumo excessivo da CPU na thread de leitura
-            time.sleep(0.005)
+                # Previne consumo excessivo da CPU na thread de leitura
+                if parar.wait(0.005):
+                    break
+        finally:
+            self._liberar(cap)
+            self._marcar_sem_sinal(parar)
+
+    def _frame_fresco(self) -> bool:
+        """True se chegou frame novo da fonte nos últimos TIMEOUT_FRAME_NOVO_S segundos (chamar com lock)."""
+        return self._seq_frame > 0 and (time.monotonic() - self._ts_ultimo_frame) <= self.TIMEOUT_FRAME_NOVO_S
 
     def ler_se_pronto(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Leitura não-bloqueante para escalonamento multi-câmera sem travar outras câmeras."""
+        """
+        Leitura não-bloqueante para escalonamento multi-câmera. Entrega cada frame
+        da fonte no máximo uma vez: um stream congelado não é processado como se
+        estivesse ao vivo (os cronômetros não avançam sobre imagem parada).
+        """
         agora = time.time()
         if (agora - self.ultimo_tempo_entrega) < self.intervalo_alvo:
             return False, None
 
         with self.lock:
-            if not self.ultimo_status or self.ultimo_frame is None:
+            if (not self.ultimo_status or self.ultimo_frame is None
+                    or self._seq_frame == self._seq_entregue or not self._frame_fresco()):
                 return False, None
             frame_copia = self.ultimo_frame.copy()
+            self._seq_entregue = self._seq_frame
 
         self.ultimo_tempo_entrega = agora
         return True, frame_copia
 
     @property
     def conectada(self) -> bool:
+        """Conectada = último read com sucesso E frame novo recente (detecta stream congelado)."""
         with self.lock:
-            return bool(self.ultimo_status)
+            return bool(self.ultimo_status) and self._frame_fresco()
 
     def ler(self) -> Tuple[bool, Optional[np.ndarray]]:
         """
@@ -204,13 +279,20 @@ class StreamCamera:
         self.ultimo_tempo_entrega = time.time()
         return status, frame_copia
 
-    def parar(self):
-        """Para a thread e libera os recursos da câmera."""
+    def parar(self, aguardar_s: float = 2.0):
+        """
+        Sinaliza a thread para parar e aguarda até `aguardar_s`. O `cap` é local da
+        thread e liberado por ela ao sair; se estiver presa num open/read lento, sai
+        sozinha quando o timeout vencer (daemon), sem afetar um novo iniciar().
+        """
         self.running = False
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=2.0)
-        if self.cap:
-            self.cap.release()
+        self._parar_evento.set()
+        with self.lock:
+            self.ultimo_status = False
+        if self.thread and self.thread.is_alive() and aguardar_s > 0:
+            self.thread.join(timeout=aguardar_s)
+            if self.thread.is_alive():
+                print(f"⏳ Stream {self._fonte_mascarada()} ainda encerrando (leitura em andamento); será liberado em segundo plano.")
         print(f"🔌 Stream da câmera finalizado. Total de frames lidos: {self.total_frames_lidos}")
 
     def __enter__(self):

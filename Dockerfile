@@ -25,8 +25,20 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copia os pesos dos modelos e o código da aplicação
-COPY yolov10n.pt yolov10b.pt /app/
+# Pesos do YOLO. Os arquivos .pt não vão para o git; se `models/` já tiver o peso
+# escolhido, ele é usado; senão é baixado no build pelo mecanismo oficial do
+# Ultralytics (repositório github.com/ultralytics/assets). O build falha de forma
+# explícita se o peso não estiver presente ao final.
+ARG YOLO_MODEL=yolov10b.pt
+ENV YOLO_MODEL_PATH=/app/models/${YOLO_MODEL}
+COPY models/ /app/models/
+RUN if [ ! -f "$YOLO_MODEL_PATH" ]; then \
+        cd /app/models && \
+        python -c "import sys; from ultralytics.utils.downloads import attempt_download_asset; attempt_download_asset(sys.argv[1])" "$YOLO_MODEL"; \
+    fi && \
+    test -f "$YOLO_MODEL_PATH" || (echo "ERRO: peso $YOLO_MODEL_PATH ausente" && exit 1)
+
+# Código da aplicação
 COPY src/ /app/src/
 
 # Cria pasta de dados persistente

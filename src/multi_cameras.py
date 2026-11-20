@@ -4,10 +4,11 @@ Compartilha uma única instância do modelo YOLO na memória RAM entre todas as 
 ativas, escalonando leituras não-bloqueantes e exportando o estado consolidado para o Dashboard.
 """
 
-import json
-import os
+import sqlite3
 import sys
 import time
+import traceback
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from ultralytics import YOLO
@@ -24,7 +25,14 @@ from config_cameras import (
     carregar_cameras_config,
     mascarar_fonte_segura,
 )
-from motor_estados import MotorEstados
+from io_atomico import assinatura_arquivo, escrever_json_atomico, limpar_temporarios_orfaos
+from motor_estados import MODELO_PADRAO, MotorEstados
+
+# Limites de memória para operação 24/7
+MAX_EVENTOS_MEMORIA = 1000          # eventos recentes mantidos para o log JSON
+COMPACTAR_HISTORICO_MOTOR_ACIMA = 200  # eventos já persistidos são descartados do motor
+INTERVALO_REPETICAO_LOG_S = 60.0    # mesmo erro repetido só é impresso 1x por minuto
+LIMITE_RETENTATIVA_EVENTO_S = 120.0  # evento que falha no banco por mais que isso é descartado
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     try:
@@ -40,7 +48,7 @@ class GerenciadorMultiCameras:
         self,
         cameras_config_path: Path = CAMERAS_CONFIG_PATH,
         regras_path: Path = Path("data/regras_config.json"),
-        model_path: str = "yolov10b.pt",
+        model_path: str = MODELO_PADRAO,
         conf_thresh: float = 0.18,
         db_path: Path = DB_PATH_PADRAO,
         intervalo_amostra_seg: float = 60.0,
@@ -59,21 +67,43 @@ class GerenciadorMultiCameras:
         self._ultimo_refresh_stats = time.time()
         self._ultima_amostra_db = 0.0
 
-        self._cameras_mtime: Optional[float] = None
+        self._cameras_mtime: Optional[tuple] = None  # assinatura (mtime_ns, tamanho, inode)
         self.runners: Dict[str, Dict[str, Any]] = {}
         self.configs_por_id: Dict[str, dict] = {}
         self.erros_por_id: Dict[str, str] = {}
-        self.historico_global: List[dict] = []
+        self.historico_global: deque = deque(maxlen=MAX_EVENTOS_MEMORIA)
+        self.total_eventos = 0
         self._ultimo_idx_eventos: Dict[str, int] = {}
+        self._evento_parcial: Dict[str, dict] = {}  # evento já gravado cuja visita falhou
+        self._falha_evento: Dict[str, tuple] = {}   # (evento, monotonic da 1ª falha) por câmera
+        self._ultimo_log_erro: Dict[str, float] = {}
+
+        # Temporários deixados por um processo morto no meio de uma escrita
+        for pasta in (Path("data"), Path("data") / "videos", Path("data") / "cameras"):
+            limpar_temporarios_orfaos(pasta)
 
         self._recarregar_cameras(inicial=True)
 
     def _salvar_json_atomico(self, caminho: Path, dados: dict):
-        caminho.parent.mkdir(parents=True, exist_ok=True)
-        tmp = caminho.with_suffix(".tmp.json")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(dados, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, caminho)
+        escrever_json_atomico(Path(caminho), dados)
+
+    def _logar_erro(self, chave: str, mensagem: str, exc: Optional[BaseException] = None):
+        """Imprime o erro (com traceback na 1ª vez) sem inundar o log se ele se repetir a cada laço."""
+        try:
+            agora = time.monotonic()
+            ultimo = self._ultimo_log_erro.get(chave)
+            if ultimo is not None and agora - ultimo < INTERVALO_REPETICAO_LOG_S:
+                return
+            primeira_vez = ultimo is None
+            self._ultimo_log_erro[chave] = agora
+            print(f"⚠️ {mensagem}")
+            if primeira_vez and exc is not None:
+                traceback.print_exception(type(exc), exc, exc.__traceback__)
+        except Exception:
+            pass  # o log nunca pode derrubar o laço 24/7 (stdout fechado, encoding...)
+
+    def _limpar_erro(self, chave: str):
+        self._ultimo_log_erro.pop(chave, None)
 
     def _iniciar_runner(self, cfg: dict):
         cid = cfg["id"]
@@ -109,26 +139,40 @@ class GerenciadorMultiCameras:
         self.erros_por_id.pop(cid, None)
         if runner:
             try:
-                runner["stream"].parar()
+                # Espera curta: o cap é local da thread de captura, que termina sozinha;
+                # não vale travar as outras câmeras esperando um open/read lento.
+                runner["stream"].parar(aguardar_s=0.5)
             except Exception:
                 pass
+            # Última chance de gravar eventos pendentes antes de descartar o motor
+            try:
+                self.registrar_eventos_motor(runner["motor"], cid)
+            except Exception as e:
+                self._logar_erro(f"eventos_finais_{cid}", f"Eventos pendentes da câmera [{cid}] não gravados: {e}", e)
             self._ultimo_idx_eventos.pop(cid, None)
+            self._evento_parcial.pop(cid, None)
+            self._falha_evento.pop(cid, None)
 
     def _recarregar_cameras(self, inicial: bool = False) -> bool:
         """Detecta mudanças em `data/cameras_config.json` e atualiza streams sem reiniciar."""
-        if not inicial and self.cameras_config_path.exists():
-            try:
-                mtime = self.cameras_config_path.stat().st_mtime
-                if self._cameras_mtime is not None and mtime == self._cameras_mtime:
-                    return False
-            except Exception:
-                return False
+        # mtime ANTES da leitura: se o arquivo mudar durante a leitura, a próxima
+        # iteração vê um mtime diferente e relê (antes a edição podia ser perdida).
+        mtime = assinatura_arquivo(self.cameras_config_path)
+        if not inicial and mtime is not None and self._cameras_mtime is not None and mtime == self._cameras_mtime:
+            return False
 
-        configs = carregar_cameras_config(self.cameras_config_path)
         try:
-            self._cameras_mtime = self.cameras_config_path.stat().st_mtime
-        except Exception:
-            self._cameras_mtime = None
+            configs = carregar_cameras_config(self.cameras_config_path)
+        except Exception as e:
+            if inicial:
+                raise
+            # Arquivo ilegível: mantém as câmeras rodando como estão
+            self._cameras_mtime = mtime
+            self._logar_erro("cameras_config", f"Falha ao recarregar câmeras (mantendo as atuais): {e}", e)
+            return False
+        self._limpar_erro("cameras_config")
+        # Arquivo criado agora pela câmera padrão: registra a assinatura dele
+        self._cameras_mtime = mtime if mtime is not None else assinatura_arquivo(self.cameras_config_path)
 
         novos_map = {c["id"]: c for c in configs}
         self.configs_por_id = novos_map
@@ -168,32 +212,43 @@ class GerenciadorMultiCameras:
         return True
 
     def registrar_eventos_motor(self, motor: MotorEstados, cid: str, agora: Optional[float] = None):
-        """Persiste novos eventos no SQLite e atualiza medianas ao concluir visitas."""
+        """
+        Persiste novos eventos no SQLite e atualiza medianas ao concluir visitas.
+
+        O cursor por câmera só avança DEPOIS que o evento foi gravado. Se o banco
+        estiver bloqueado/ocupado (sqlite3.OperationalError, transitório), para e
+        tenta de novo na próxima iteração, sem perder o evento. Erros de outro tipo
+        (dado inválido) são registrados e o evento é pulado, para não travar a fila.
+        Eventos já persistidos são descartados do motor para a memória não crescer.
+        """
         t_ref = agora if agora is not None else time.time()
-        idx_ant = self._ultimo_idx_eventos.get(cid, 0)
-        if len(motor.historico_alertas) <= idx_ant:
+        idx = self._ultimo_idx_eventos.get(cid, 0)
+        historico = motor.historico_alertas
+        if len(historico) <= idx:
             return
 
-        novos = motor.historico_alertas[idx_ant:]
-        self.historico_global.extend(novos)
-        self._ultimo_idx_eventos[cid] = len(motor.historico_alertas)
-
         atualizar_stats = False
-        for evt in novos:
-            epoch_evt = float(evt.get("epoch", t_ref))
-            cam_id = evt.get("camera_id", cid)
-            cam_nome = evt.get("camera_nome", motor.camera_nome)
-            mesa_id = evt.get("mesa_id", "")
-            tipo = evt.get("tipo", "EVENTO")
+        while idx < len(historico):
+            evt = historico[idx]
+            mesa_id, tipo = "", "EVENTO"
             try:
-                self.analytics_db.registrar_evento(
-                    epoch=epoch_evt,
-                    camera_id=cam_id,
-                    camera_nome=cam_nome,
-                    mesa_id=mesa_id,
-                    tipo_evento=tipo,
-                    detalhes=evt,
-                )
+                epoch_evt = float(evt.get("epoch", t_ref))
+                cam_id = evt.get("camera_id", cid)
+                cam_nome = evt.get("camera_nome", motor.camera_nome)
+                mesa_id = evt.get("mesa_id", "")
+                tipo = evt.get("tipo", "EVENTO")
+                # Se numa tentativa anterior o evento foi gravado e só a visita
+                # falhou (banco ocupado), não grava o evento de novo (sem duplicar).
+                if self._evento_parcial.get(cid) is not evt:
+                    self.analytics_db.registrar_evento(
+                        epoch=epoch_evt,
+                        camera_id=cam_id,
+                        camera_nome=cam_nome,
+                        mesa_id=mesa_id,
+                        tipo_evento=tipo,
+                        detalhes=evt,
+                    )
+                    self._evento_parcial[cid] = evt
                 if tipo == "MESA_DESOCUPADA" and evt.get("duracao_permanencia") is not None:
                     if self.analytics_db.registrar_visita(
                         camera_id=cam_id,
@@ -207,8 +262,32 @@ class GerenciadorMultiCameras:
                         houve_alerta=bool(evt.get("houve_alerta", False)),
                     ):
                         atualizar_stats = True
+            except sqlite3.OperationalError as e:
+                # Normalmente transitório (database is locked/busy): mantém o cursor e
+                # tenta depois. Se o MESMO evento falhar por mais de LIMITE_RETENTATIVA_EVENTO_S
+                # (disco cheio, banco somente leitura...), descarta para a fila não travar.
+                evt_falho, desde = self._falha_evento.get(cid, (None, None))
+                if evt_falho is not evt:
+                    self._falha_evento[cid] = (evt, time.monotonic())
+                    desde = time.monotonic()
+                if time.monotonic() - desde < LIMITE_RETENTATIVA_EVENTO_S:
+                    self._logar_erro(f"db_evento_{cid}", f"Banco indisponível ao gravar evento [{cid}/{mesa_id}]; nova tentativa em seguida: {e}")
+                    break
+                self._logar_erro(f"db_evento_descartado_{cid}", f"Evento descartado após {LIMITE_RETENTATIVA_EVENTO_S:.0f}s de falhas no banco [{cid}/{mesa_id}/{tipo}]: {e}", e)
             except Exception as e:
-                print(f"⚠️ Erro ao persistir evento analítico [{cid}/{mesa_id}]: {e}")
+                self._logar_erro(f"evento_invalido_{cid}", f"Evento descartado por erro ao persistir [{cid}/{mesa_id}/{tipo}]: {e}", e)
+
+            self._falha_evento.pop(cid, None)
+            self._evento_parcial.pop(cid, None)
+            self.historico_global.append(evt)
+            self.total_eventos += 1
+            idx += 1
+
+        # Compacta o histórico do motor: o que já foi persistido sai da memória
+        if idx >= COMPACTAR_HISTORICO_MOTOR_ACIMA:
+            del historico[:idx]
+            idx = 0
+        self._ultimo_idx_eventos[cid] = idx
 
         if atualizar_stats:
             self._stats_permanencia = self.analytics_db.obter_estatisticas_permanencia()
@@ -311,53 +390,85 @@ class GerenciadorMultiCameras:
         try:
             while True:
                 agora = time.time()
-                if self._recarregar_cameras():
-                    ultimo_export = 0.0
+                try:
+                    if self._recarregar_cameras():
+                        ultimo_export = 0.0
+                except Exception as e:
+                    self._logar_erro("recarregar_cameras", f"Erro ao recarregar câmeras: {e}", e)
 
                 for cid, runner in list(self.runners.items()):
-                    cfg = runner["cfg"]
-                    motor: MotorEstados = runner["motor"]
-                    stream: StreamCamera = runner["stream"]
-
-                    if motor._carregar_mesas_do_disco():
-                        ultimo_export = 0.0
-                    motor._atualizar_regras_do_disco()
-
-                    ret, frame = stream.ler_se_pronto()
-                    if not ret or frame is None:
-                        continue
-
-                    if agora - runner["ultimo_limpo"] >= 5.0:
-                        runner["ultimo_limpo"] = agora
-                        motor._salvar_imagem_atomica(Path(cfg["frame_limpo_path"]), frame)
-
-                    anotado = motor.processar_frame(frame, timestamp_simulado=agora - t0)
-                    self.registrar_eventos_motor(motor, cid, agora=agora)
-
-                    if agora - runner["ultimo_vivo"] >= 1.0:
-                        runner["ultimo_vivo"] = agora
-                        motor._salvar_imagem_atomica(Path(cfg["frame_vivo_path"]), anotado)
+                    # Isolamento por câmera: um frame ruim, zona malformada ou falha de
+                    # escrita numa câmera não derruba as demais nem o processo.
+                    try:
+                        if self._processar_camera(cid, runner, agora, t0):
+                            ultimo_export = 0.0
+                        if self.erros_por_id.pop(cid, None) is not None:
+                            print(f"✅ Câmera [{cid}] voltou a processar normalmente.")
+                        self._limpar_erro(f"camera_{cid}")
+                    except Exception as e:
+                        self.erros_por_id[cid] = f"Falha no processamento: {e}"
+                        self._logar_erro(f"camera_{cid}", f"Erro ao processar câmera [{cid}]: {e}", e)
 
                 if agora - self._ultimo_refresh_stats >= 30.0:
                     self._ultimo_refresh_stats = agora
-                    self._stats_permanencia = self.analytics_db.obter_estatisticas_permanencia()
+                    self._tarefa_protegida("refresh_stats", self._atualizar_stats)
 
                 if agora - t0 >= 10.0 and agora - self._ultima_amostra_db >= self.intervalo_amostra_seg:
                     self._ultima_amostra_db = agora
-                    self.registrar_amostras_ocupacao(agora)
+                    self._tarefa_protegida("amostras", self.registrar_amostras_ocupacao, agora)
 
                 if agora - ultimo_export >= 1.0:
                     ultimo_export = agora
-                    self.exportar_estado_consolidado(estado_path)
+                    self._tarefa_protegida("export_estado", self.exportar_estado_consolidado, estado_path)
 
                 if agora - ultimo_log >= 5.0:
                     ultimo_log = agora
-                    self._salvar_json_atomico(json_log_path, {
-                        "total_eventos": len(self.historico_global),
-                        "eventos": self.historico_global[-100:],
+                    self._tarefa_protegida("log_alertas", self._salvar_json_atomico, json_log_path, {
+                        "total_eventos": self.total_eventos,
+                        "eventos": list(self.historico_global)[-100:],
                     })
 
                 time.sleep(0.02)
         finally:
             for cid in list(self.runners.keys()):
                 self._parar_runner(cid)
+
+    def _processar_camera(self, cid: str, runner: Dict[str, Any], agora: float, t0: float) -> bool:
+        """Um passo de processamento de uma câmera. Retorna True se as mesas foram recarregadas."""
+        cfg = runner["cfg"]
+        motor: MotorEstados = runner["motor"]
+        stream: StreamCamera = runner["stream"]
+
+        mesas_recarregadas = motor._carregar_mesas_do_disco()
+        motor._atualizar_regras_do_disco()
+
+        ret, frame = stream.ler_se_pronto()
+        if not ret or frame is None:
+            # Persiste eventos pendentes mesmo sem frame novo (ex.: banco estava ocupado)
+            self.registrar_eventos_motor(motor, cid, agora=agora)
+            return mesas_recarregadas
+
+        if agora - runner["ultimo_limpo"] >= 5.0:
+            runner["ultimo_limpo"] = agora
+            self._tarefa_protegida(f"frame_limpo_{cid}", motor._salvar_imagem_atomica, Path(cfg["frame_limpo_path"]), frame)
+
+        anotado = motor.processar_frame(frame, timestamp_simulado=agora - t0)
+        self.registrar_eventos_motor(motor, cid, agora=agora)
+
+        if agora - runner["ultimo_vivo"] >= 1.0:
+            runner["ultimo_vivo"] = agora
+            self._tarefa_protegida(f"frame_vivo_{cid}", motor._salvar_imagem_atomica, Path(cfg["frame_vivo_path"]), anotado)
+        return mesas_recarregadas
+
+    def _atualizar_stats(self):
+        self._stats_permanencia = self.analytics_db.obter_estatisticas_permanencia()
+
+    def _tarefa_protegida(self, chave: str, fn, *args) -> bool:
+        """Executa uma tarefa periódica sem deixar a exceção derrubar o laço principal."""
+        try:
+            fn(*args)
+            self._limpar_erro(chave)
+            return True
+        except Exception as e:
+            self._logar_erro(chave, f"Falha na tarefa '{chave}': {e}", e)
+            return False

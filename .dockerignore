@@ -1,0 +1,45 @@
+# ==============================================================================
+# .dockerignore — mantém o contexto de build pequeno e sem dados sensíveis.
+# data/ contém URLs RTSP com senha, histórico SQLite e imagens de clientes (LGPD):
+# nunca deve entrar na imagem; é montado como volume em runtime.
+# ==============================================================================
+
+# Dados de operação, segredos e banco
+data/
+.env
+.env.*
+**/secrets.toml
+*.db
+*.db-wal
+*.db-shm
+
+# Ambiente e caches Python
+.venv/
+venv/
+env/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Pesos soltos na raiz (o build usa somente models/)
+/*.pt
+/*.pth
+/*.onnx
+
+# Mídia
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Repositório, nuvem e editores (não fazem parte da imagem do edge)
+.git/
+.gitignore
+cloud/
+deploy/
+.vscode/
+.idea/
+.claude/
+*.md

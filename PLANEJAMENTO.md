@@ -225,6 +225,27 @@ Para garantir que o cronômetro só seja encerrado na entrega real da comida, o 
 - [ ] Painel de saúde dos restaurantes (último sync de cada loja) para o admin.
 - [ ] Teste ponta a ponta com Postgres real e deploy na VPS.
 
+**Decisão (19/11/2026):** os **relatórios** ficam no portal em nuvem (acesso de qualquer lugar, todas as lojas); a **operação** (câmeras, calibração, painel ao vivo, alertas do salão) fica no Mini PC, acessível na rede local e pelo técnico via Tailscale. Imagens nunca passam pela nuvem.
+
+#### 📍 Fase 10: Kit de Implantação (simples de implantar em ambientes diversos)
+- [ ] Mini PC pré-gravado com o software instalado e já registrado na nuvem (token provisionado, sem `.env` manual).
+- [ ] Assistente de primeira configuração no painel local: descoberta de câmeras (ONVIF), teste de qualidade da câmera (ângulo, luz, pessoas detectadas), desenho guiado das mesas.
+- [ ] **Perfis de operação** por tipo de estabelecimento: à mesa (FSM completa), self-service/por quilo e balcão (só ocupação e giro).
+- [ ] Modo de validação nos primeiros dias para ajustar os limites ao salão.
+- [ ] Guia de avaliação do local (posição/ângulo de câmera, iluminação, oclusão).
+- [ ] Pilotos em 2–3 restaurantes de perfis diferentes antes da escala.
+
+#### 📍 Fase 11: Portal de Gestão da Frota (admin da plataforma)
+Modelo **pull**: o Mini PC nunca recebe conexão de entrada (CGNAT/segurança); ele envia saúde e busca comandos periodicamente.
+- [ ] Telemetria de saúde por dispositivo: último contato, versão, câmeras ativas/conectadas, FPS real, CPU/RAM/disco.
+- [ ] Painel da frota: todas as lojas e dispositivos, status online/offline e alertas de loja ou câmera parada.
+- [ ] Cadastro de cliente e dispositivo pelo portal (gera o kit/token), gestão de usuários (donos/gerentes) sem CLI.
+- [ ] Configuração remota sem imagens (regras de tempo, perfil de operação) aplicada pelo Mini PC no próximo contato.
+- [ ] Atualização remota do software (versão publicada pela plataforma, imagens assinadas, aplicação controlada pelo Mini PC).
+- [ ] v2: captura de quadro sob demanda para calibração remota, restrita ao admin e auditada (LGPD).
+
+**Ordem de execução atual das correções (revisão de 19/11/2026):** P1 instalação limpa ✅ → P2 resiliência do motor ✅ → P3 painel local restrito à LAN/Tailscale + PIN de administração → P4 correções de relatórios + portal de relatórios (Fase 9) → P5 precisão da FSM → persistência de estado → desempenho no N100 → Fase 10 → Fase 11.
+
 ---
 
 ### 6. Matriz de Requisitos de Hardware & Tecnologias

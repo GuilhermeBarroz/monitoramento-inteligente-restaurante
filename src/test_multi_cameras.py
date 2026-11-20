@@ -289,10 +289,41 @@ def testar_gerenciador_multi_cameras_e_hot_reload():
     print("✅ [OK] Teste 5: GerenciadorMultiCameras (modelo compartilhado, snapshot consolidado e hot-reload)")
 
 
+def testar_camera_padrao_instalacao_limpa():
+    """Instalação nova sem o vídeo de exemplo não pode quebrar: cam_1 nasce pausada."""
+    import os
+
+    orig_cwd = Path.cwd()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            os.chdir(tmpdir)
+            cfg = Path("data") / "cameras_config.json"
+
+            # Sem vídeo de exemplo: cria cam_1 pausada (webcam 0), sem exceção
+            cams = config_cameras.carregar_cameras_config(config_path=cfg)
+            assert len(cams) == 1
+            assert cams[0]["id"] == "cam_1"
+            assert cams[0]["ativa"] is False
+            assert cams[0]["fonte"] == "0"
+            assert cfg.exists()
+
+            # Com o vídeo de exemplo presente: cam_1 ativa apontando para ele
+            cfg.unlink()
+            _criar_video_sintetico(Path(config_cameras.VIDEO_EXEMPLO))
+            cams = config_cameras.carregar_cameras_config(config_path=cfg)
+            assert cams[0]["ativa"] is True
+            assert cams[0]["fonte"] == config_cameras.VIDEO_EXEMPLO
+        finally:
+            os.chdir(orig_cwd)
+
+    print("✅ [OK] Teste 6: Câmera padrão em instalação limpa (pausada sem vídeo de exemplo)")
+
+
 if __name__ == "__main__":
     testar_seguranca_fontes_e_ids()
     testar_caminhos_derivados_e_compatibilidade()
     testar_persistencia_e_upload_video_isolado()
     testar_stream_camera_nao_bloqueante()
     testar_gerenciador_multi_cameras_e_hot_reload()
+    testar_camera_padrao_instalacao_limpa()
     print("\n🎉 Todos os testes Multi-Câmeras passaram com sucesso!")

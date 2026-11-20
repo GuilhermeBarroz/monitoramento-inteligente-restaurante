@@ -18,6 +18,7 @@ from ultralytics import YOLO
 sys.path.append(str(Path(__file__).parent))
 from fsm_mesas import MesaFSM, EstadoMesa, TipoAlerta
 from detector_garcom import AnalisadorUniformeHSV, RastreadorAtendimentoMesa
+from io_atomico import assinatura_arquivo, escrever_imagem_atomica, escrever_json_atomico
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     try:
@@ -35,10 +36,14 @@ CORES_ESTADO = {
     EstadoMesa.PENDENTE_LIMPEZA: (0, 140, 255)        # Laranja
 }
 
+# Pesos do YOLO: no Docker vêm de YOLO_MODEL_PATH (baixados no build em /app/models);
+# em desenvolvimento local, o arquivo na raiz do repositório.
+MODELO_PADRAO = os.environ.get("YOLO_MODEL_PATH", "yolov10b.pt")
+
 class MotorEstados:
     def __init__(self, config_path: str = "data/mesas_config.json",
                  regras_path: str = "data/regras_config.json",
-                 model_path: str = "yolov10b.pt",
+                 model_path: str = MODELO_PADRAO,
                  conf_thresh: float = 0.18,
                  limite_espera_garcom: float = 300.0,
                  limite_cozinha: float = 1200.0,
@@ -71,7 +76,8 @@ class MotorEstados:
         self.permanencia_padrao_segundos = 2700.0
         self.mesas_por_garcom = 4
         self.analisador_uniforme = AnalisadorUniformeHSV(self.uniforme_cor_preset, self.uniforme_ratio_min)
-        self._mesas_mtime = None
+        self._mesas_mtime = None   # assinatura (mtime_ns, tamanho, inode) da última versão lida
+        self._regras_mtime = None
 
         self.historico_alertas = []
         self.mesas = []
@@ -93,17 +99,23 @@ class MotorEstados:
         if not self.config_path.exists():
             return False
 
+        mtime = None
         try:
-            mtime = self.config_path.stat().st_mtime
+            mtime = assinatura_arquivo(self.config_path)
             if not inicial and self._mesas_mtime is not None and mtime == self._mesas_mtime:
                 return False
 
             with open(self.config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
+            mesas_lidas = self._interpretar_mesas(config)
         except Exception as e:
             if inicial:
                 raise
-            print(f"⚠️ Erro ao recarregar configuração de mesas: {e}")
+            # Marca esta versão do arquivo como vista: mantém as mesas atuais e não
+            # repete o erro a cada iteração do laço; tenta de novo quando o arquivo mudar.
+            if mtime is not None:
+                self._mesas_mtime = mtime
+            print(f"⚠️ Configuração de mesas inválida em {self.config_path} (mantendo as mesas atuais): {e}")
             return False
 
         novas_mesas = []
@@ -112,17 +124,12 @@ class MotorEstados:
         caches_atuais = {}
         rastreadores_atuais = {}
 
-        for m in config.get("mesas", []):
-            pontos = m.get("pontos", [])
-            if len(pontos) < 3:
-                continue
-            pts_np = np.array(pontos, np.int32).reshape((-1, 1, 2))
-            mesa_id = m["id"]
+        for mesa_id, descricao, pontos, pts_np in mesas_lidas:
             novos_ids.add(mesa_id)
 
             novas_mesas.append({
                 "id": mesa_id,
-                "descricao": m.get("descricao", ""),
+                "descricao": descricao,
                 "pontos_np": pts_np,
                 "pontos_raw": pontos
             })
@@ -161,48 +168,103 @@ class MotorEstados:
         self.debounce_cache = caches_atuais
         self.rastreadores_atendimento = rastreadores_atuais
         self._mesas_mtime = mtime
-        self._atualizar_regras_do_disco()
+        self._atualizar_regras_do_disco(forcar=True)
 
         if not inicial:
             print(f"🔄 Configuração de mesas recarregada ao vivo ({len(self.mesas)} mesas).")
         return True
 
-    def _atualizar_regras_do_disco(self):
-        """Lê data/regras_config.json para aplicar ajustes dinâmicos feitos no Dashboard."""
-        if self.regras_path.exists():
+    @staticmethod
+    def _interpretar_mesas(config: dict) -> list:
+        """
+        Valida o JSON de mesas ANTES de trocar o estado do motor. Levanta ValueError
+        se algum polígono estiver malformado; nada é aplicado pela metade.
+        Retorna [(mesa_id, descricao, pontos, pontos_np), ...].
+        """
+        if not isinstance(config, dict) or not isinstance(config.get("mesas", []), list):
+            raise ValueError("formato inválido: esperado objeto com lista 'mesas'")
+        resultado = []
+        for idx, m in enumerate(config.get("mesas", []), start=1):
+            if not isinstance(m, dict):
+                raise ValueError(f"mesa #{idx} não é um objeto")
+            mesa_id = str(m.get("id", "")).strip()
+            if not mesa_id:
+                raise ValueError(f"mesa #{idx} sem 'id'")
+            pontos = m.get("pontos", [])
+            if not isinstance(pontos, list) or len(pontos) < 3:
+                continue  # zona incompleta: ignorada, como antes
             try:
-                with open(self.regras_path, "r", encoding="utf-8") as f:
-                    regras = json.load(f)
-                espera_seg = float(regras.get("limite_espera_garcom_minutos", 5.0)) * 60.0
-                cozinha_seg = float(regras.get("limite_cozinha_minutos", 20.0)) * 60.0
-                limpeza_seg = float(regras.get("limite_limpeza_minutos", 3.0)) * 60.0
+                pts_np = np.array(pontos, np.int32).reshape((-1, 1, 2))
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"mesa '{mesa_id}' com pontos inválidos: {e}") from e
+            resultado.append((mesa_id, m.get("descricao", ""), pontos, pts_np))
+        return resultado
 
-                self.deteccao_garcom_excedente = bool(regras.get("deteccao_garcom_excedente", True))
-                self.visita_min_segundos = float(regras.get("visita_min_segundos", 4.0))
-                self.visita_max_segundos = float(regras.get("visita_max_segundos", 180.0))
-                self.limpeza_min_segundos = float(regras.get("limpeza_min_segundos", 5.0))
-                self.ocupar_apos_suja_segundos = float(regras.get("ocupar_apos_suja_segundos", 45.0))
+    def _atualizar_regras_do_disco(self, forcar: bool = False):
+        """
+        Lê data/regras_config.json para aplicar ajustes feitos no Dashboard. Só relê
+        quando o arquivo muda (antes era aberto e parseado a cada iteração do laço).
+        `forcar=True` reaplica as regras atuais, ex.: a FSMs recém-criadas.
+        """
+        mtime = assinatura_arquivo(self.regras_path)
+        if mtime is None:
+            return
+        if not forcar and mtime == self._regras_mtime:
+            return
+        self._regras_mtime = mtime
 
-                self.uniforme_ativo = bool(regras.get("uniforme_ativo", False))
-                self.uniforme_cor_preset = str(regras.get("uniforme_cor_preset", "Preto / Escuro"))
-                self.uniforme_ratio_min = float(regras.get("uniforme_ratio_min", 0.25))
-                self.uniforme_margem_px = int(regras.get("uniforme_margem_px", 35))
-                self.permanencia_padrao_segundos = max(60.0, float(regras.get("permanencia_padrao_minutos", 45.0)) * 60.0)
-                self.mesas_por_garcom = max(1, int(regras.get("mesas_por_garcom", 4)))
-                self.analisador_uniforme.configurar(self.uniforme_cor_preset, self.uniforme_ratio_min)
+        # 1) Lê e converte TUDO antes de aplicar: um valor inválido não deixa
+        #    as regras aplicadas pela metade.
+        try:
+            with open(self.regras_path, "r", encoding="utf-8") as f:
+                regras = json.load(f)
+            if not isinstance(regras, dict):
+                raise ValueError("esperado um objeto JSON")
+            novas = {
+                "espera_seg": float(regras.get("limite_espera_garcom_minutos", 5.0)) * 60.0,
+                "cozinha_seg": float(regras.get("limite_cozinha_minutos", 20.0)) * 60.0,
+                "limpeza_seg": float(regras.get("limite_limpeza_minutos", 3.0)) * 60.0,
+                "deteccao_garcom_excedente": bool(regras.get("deteccao_garcom_excedente", True)),
+                "visita_min_segundos": float(regras.get("visita_min_segundos", 4.0)),
+                "visita_max_segundos": float(regras.get("visita_max_segundos", 180.0)),
+                "limpeza_min_segundos": float(regras.get("limpeza_min_segundos", 5.0)),
+                "ocupar_apos_suja_segundos": float(regras.get("ocupar_apos_suja_segundos", 45.0)),
+                "uniforme_ativo": bool(regras.get("uniforme_ativo", False)),
+                "uniforme_cor_preset": str(regras.get("uniforme_cor_preset", "Preto / Escuro")),
+                "uniforme_ratio_min": float(regras.get("uniforme_ratio_min", 0.25)),
+                "uniforme_margem_px": int(regras.get("uniforme_margem_px", 35)),
+                "permanencia_padrao_segundos": max(60.0, float(regras.get("permanencia_padrao_minutos", 45.0)) * 60.0),
+                "mesas_por_garcom": max(1, int(regras.get("mesas_por_garcom", 4))),
+            }
+        except Exception as e:
+            # Mantém as regras anteriores; avisa uma vez por versão do arquivo
+            print(f"⚠️ regras_config.json inválido (mantendo regras anteriores): {e}")
+            return
 
-                for fsm in self.fsms.values():
-                    fsm.limite_espera_garcom = espera_seg
-                    fsm.limite_cozinha = cozinha_seg
-                    fsm.limite_limpeza = limpeza_seg
-                    fsm.limpeza_min_segundos = self.limpeza_min_segundos
-                    fsm.ocupar_apos_suja_segundos = self.ocupar_apos_suja_segundos
+        # 2) Aplica
+        self.deteccao_garcom_excedente = novas["deteccao_garcom_excedente"]
+        self.visita_min_segundos = novas["visita_min_segundos"]
+        self.visita_max_segundos = novas["visita_max_segundos"]
+        self.limpeza_min_segundos = novas["limpeza_min_segundos"]
+        self.ocupar_apos_suja_segundos = novas["ocupar_apos_suja_segundos"]
+        self.uniforme_ativo = novas["uniforme_ativo"]
+        self.uniforme_cor_preset = novas["uniforme_cor_preset"]
+        self.uniforme_ratio_min = novas["uniforme_ratio_min"]
+        self.uniforme_margem_px = novas["uniforme_margem_px"]
+        self.permanencia_padrao_segundos = novas["permanencia_padrao_segundos"]
+        self.mesas_por_garcom = novas["mesas_por_garcom"]
+        self.analisador_uniforme.configurar(self.uniforme_cor_preset, self.uniforme_ratio_min)
 
-                for rastreador in self.rastreadores_atendimento.values():
-                    rastreador.visita_min_s = self.visita_min_segundos
-                    rastreador.visita_max_s = self.visita_max_segundos
-            except Exception:
-                pass
+        for fsm in self.fsms.values():
+            fsm.limite_espera_garcom = novas["espera_seg"]
+            fsm.limite_cozinha = novas["cozinha_seg"]
+            fsm.limite_limpeza = novas["limpeza_seg"]
+            fsm.limpeza_min_segundos = self.limpeza_min_segundos
+            fsm.ocupar_apos_suja_segundos = self.ocupar_apos_suja_segundos
+
+        for rastreador in self.rastreadores_atendimento.values():
+            rastreador.visita_min_s = self.visita_min_segundos
+            rastreador.visita_max_s = self.visita_max_segundos
 
     def formatar_tempo(self, segundos: float) -> str:
         """Converte segundos em formato MM:SS."""
@@ -211,19 +273,12 @@ class MotorEstados:
         return f"{m:02d}:{s:02d}"
 
     def _salvar_json_atomico(self, caminho: Path, dados: dict):
-        """Escreve JSON em arquivo temporário e renomeia atomicamente para evitar leitura corrompida."""
-        caminho.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = caminho.with_suffix(".tmp.json")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(dados, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, caminho)
+        """Escreve JSON atomicamente (ver io_atomico) para o Dashboard nunca ler arquivo pela metade."""
+        escrever_json_atomico(Path(caminho), dados)
 
     def _salvar_imagem_atomica(self, caminho: Path, img: np.ndarray):
         """Salva JPEG atomicamente para leitura concorrente segura pelo Dashboard."""
-        caminho.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = caminho.with_name(f"{caminho.stem}_tmp{caminho.suffix}")
-        cv2.imwrite(str(tmp_path), img)
-        os.replace(tmp_path, caminho)
+        escrever_imagem_atomica(Path(caminho), img)
 
     def processar_frame(self, frame: np.ndarray, timestamp_simulado: float) -> np.ndarray:
         display = frame.copy()

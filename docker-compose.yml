@@ -10,14 +10,20 @@ services:
     container_name: monitor-mesas-dashboard
     restart: unless-stopped
     ports:
-      - "8501:8501"
+      # PAINEL_BIND_IP restringe em qual interface do Mini PC o painel escuta
+      # (ex.: IP da LAN do restaurante ou o IP 100.x do Tailscale). Nunca faça
+      # redirecionamento de porta no roteador para este serviço.
+      - "${PAINEL_BIND_IP:-0.0.0.0}:8501:8501"
     volumes:
       - ./data:/app/data
       - ./src:/app/src
     environment:
       - PYTHONUNBUFFERED=1
       - TZ=America/Sao_Paulo
-    command: ["streamlit", "run", "src/dashboard.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--server.maxUploadSize=500"]
+      # PIN das áreas de administração (câmeras, imagens, calibração, regras, relatórios).
+      # Sem PIN (mínimo 6 caracteres) essas áreas ficam bloqueadas.
+      - PAINEL_ADMIN_PIN=${PAINEL_ADMIN_PIN:-}
+    command: ["streamlit", "run", "src/dashboard.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--server.maxUploadSize=500", "--browser.gatherUsageStats=false"]
     networks:
       - rede-monitoramento
 

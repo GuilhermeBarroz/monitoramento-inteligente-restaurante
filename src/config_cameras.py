@@ -8,10 +8,13 @@ import ipaddress
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 import cv2
+
+from io_atomico import escrever_imagem_atomica, escrever_json_atomico
 
 DATA_DIR = Path("data")
 VIDEOS_DIR = DATA_DIR / "videos"
@@ -69,6 +72,10 @@ def sanitizar_fonte_camera(fonte: Any) -> str:
             raise ValueError(f"Protocolo '{parsed.scheme}' não permitido. Use RTSP, RTSPS, HTTP, HTTPS, webcam ou vídeo local.")
         if not parsed.hostname:
             raise ValueError("URL de câmera inválida: informe o IP ou hostname.")
+        try:
+            parsed.port  # levanta ValueError para porta não numérica ou fora de 0..65535
+        except ValueError as exc:
+            raise ValueError("URL de câmera inválida: porta deve ser um número entre 1 e 65535.") from exc
         if _eh_ip_bloqueado_ssrf(parsed.hostname):
             raise ValueError("Endereço IP reservado/link-local não permitido por política de segurança.")
         return fonte_str
@@ -90,16 +97,20 @@ def sanitizar_fonte_camera(fonte: Any) -> str:
 
 
 def mascarar_fonte_segura(fonte: str) -> str:
-    """Oculta senhas em URLs RTSP/HTTP para exibição segura na interface."""
+    """Oculta senhas em URLs RTSP/HTTP para exibição segura. Nunca levanta exceção."""
     s = str(fonte or "")
-    parsed = urlparse(s)
-    if parsed.scheme in {"rtsp", "rtsps", "http", "https"} and parsed.password:
-        user = parsed.username or ""
-        host = parsed.hostname or ""
-        port = f":{parsed.port}" if parsed.port else ""
-        netloc = f"{user}:****@{host}{port}"
-        return urlunparse(parsed._replace(netloc=netloc))
-    return s
+    try:
+        parsed = urlparse(s)
+        if parsed.scheme in {"rtsp", "rtsps", "http", "https"} and parsed.password:
+            user = parsed.username or ""
+            host = parsed.hostname or ""
+            port = f":{parsed.port}" if parsed.port else ""
+            netloc = f"{user}:****@{host}{port}"
+            return urlunparse(parsed._replace(netloc=netloc))
+        return s
+    except ValueError:
+        # URL malformada (ex.: porta inválida): não expõe o texto, que pode conter senha
+        return "<URL de câmera inválida>"
 
 
 def caminhos_derivados_camera(cam_id: str) -> Tuple[str, str, str]:
@@ -135,10 +146,7 @@ def _garantir_arquivo_mesas_inicial(config_mesas_path: Path, frame_limpo_path: P
         "total_mesas": 0,
         "mesas": [],
     }
-    tmp = config_mesas_path.with_suffix(".tmp.json")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(dados, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, config_mesas_path)
+    escrever_json_atomico(config_mesas_path, dados, duravel=True)
 
 
 def salvar_cameras_config(cameras_raw: List[dict], config_path: Path = CAMERAS_CONFIG_PATH) -> List[dict]:
@@ -182,34 +190,87 @@ def salvar_cameras_config(cameras_raw: List[dict], config_path: Path = CAMERAS_C
             "frame_vivo_path": frame_vivo,
         })
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = config_path.with_suffix(".tmp.json")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"cameras": normalizadas}, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, config_path)
+    escrever_json_atomico(Path(config_path), {"cameras": normalizadas}, duravel=True)
     return normalizadas
 
 
-def carregar_cameras_config(config_path: Path = CAMERAS_CONFIG_PATH) -> List[dict]:
-    """Lê `data/cameras_config.json` ou cria automaticamente a configuração padrão `cam_1`."""
-    if config_path.exists():
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                dados = json.load(f)
-            cams = dados.get("cameras", [])
-            if isinstance(cams, list) and len(cams) > 0:
-                return cams
-        except Exception:
-            pass
+# Última configuração lida com sucesso, por caminho. Usada quando uma leitura
+# falha (arquivo sendo substituído, JSON corrompido) para nunca perder câmeras.
+_ultima_config_valida: dict = {}
 
-    padrao = [{
+
+def _ler_cameras_do_arquivo(config_path: Path) -> List[dict]:
+    with open(config_path, "r", encoding="utf-8") as f:
+        dados = json.load(f)
+    cams = dados.get("cameras") if isinstance(dados, dict) else None
+    if not isinstance(cams, list) or len(cams) == 0:
+        raise ValueError("lista 'cameras' ausente ou vazia")
+    return cams
+
+
+def carregar_cameras_config(config_path: Path = CAMERAS_CONFIG_PATH) -> List[dict]:
+    """
+    Lê `data/cameras_config.json`. Cria a configuração padrão SOMENTE se o arquivo
+    não existir. Se existir mas não puder ser lido (corrida com uma escrita, JSON
+    corrompido, edição manual errada), o arquivo NUNCA é sobrescrito: tenta de novo
+    brevemente e, persistindo o erro, devolve a última configuração válida em
+    memória; sem nenhuma, levanta ValueError para o chamador tratar.
+    """
+    config_path = Path(config_path)
+    chave = str(config_path.resolve())
+
+    if not config_path.exists():
+        cams = salvar_cameras_config(_camera_padrao(), config_path=config_path)
+        _ultima_config_valida[chave] = cams
+        return cams
+
+    ultimo_erro: Optional[Exception] = None
+    for tentativa in range(3):
+        try:
+            cams = _ler_cameras_do_arquivo(config_path)
+            _ultima_config_valida[chave] = cams
+            return cams
+        except (OSError, ValueError) as e:  # JSONDecodeError é subclasse de ValueError
+            ultimo_erro = e
+            time.sleep(0.05 * (tentativa + 1))
+
+    if chave in _ultima_config_valida:
+        print(f"⚠️ cameras_config.json ilegível ({ultimo_erro}); mantendo a última configuração válida.")
+        return _ultima_config_valida[chave]
+    raise ValueError(
+        f"Não foi possível ler {config_path} ({ultimo_erro}). "
+        "O arquivo foi preservado; corrija-o ou restaure um backup."
+    )
+
+
+VIDEO_EXEMPLO = "data/videos/sample_restaurante.mp4"
+
+
+def _camera_padrao() -> List[dict]:
+    """
+    Câmera inicial de uma instalação nova.
+
+    Se o vídeo de exemplo existir (ambiente de desenvolvimento), usa-o ativo.
+    Numa instalação limpa (o vídeo não vai para o git), cria a câmera PAUSADA
+    apontando para a webcam 0, que passa na validação sem exigir arquivo, para
+    o motor e o dashboard subirem e o técnico configurar a fonte RTSP real
+    na aba de Câmeras.
+    """
+    if (DATA_DIR.parent / VIDEO_EXEMPLO).is_file():
+        return [{
+            "id": "cam_1",
+            "nome": "Salão Principal",
+            "fonte": VIDEO_EXEMPLO,
+            "ativa": True,
+            "fps_alvo": 2.5,
+        }]
+    return [{
         "id": "cam_1",
-        "nome": "Salão Principal",
-        "fonte": "data/videos/sample_restaurante.mp4",
-        "ativa": True,
+        "nome": "Salão Principal (configure a fonte)",
+        "fonte": "0",
+        "ativa": False,
         "fps_alvo": 2.5,
     }]
-    return salvar_cameras_config(padrao, config_path=config_path)
 
 
 def listar_videos_disponiveis() -> List[str]:
@@ -256,7 +317,14 @@ def extrair_frame_limpo_fonte(fonte: str, destino_jpg: Path) -> Optional[Tuple[i
     fonte_norm = sanitizar_fonte_camera(fonte)
     src: Any = int(fonte_norm) if fonte_norm.isdigit() else fonte_norm
 
-    cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG) if isinstance(src, str) and src.startswith("rtsp") else cv2.VideoCapture(src)
+    if isinstance(src, str) and urlparse(src).scheme in {"rtsp", "rtsps", "http", "https"}:
+        # Timeouts: uma câmera inacessível não pode travar a página do painel
+        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG, [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000,
+        ])
+    else:
+        cap = cv2.VideoCapture(src)
     if not cap.isOpened():
         cap.release()
         return None
@@ -266,9 +334,6 @@ def extrair_frame_limpo_fonte(fonte: str, destino_jpg: Path) -> Optional[Tuple[i
     if not sucesso or frame is None:
         return None
 
-    destino_jpg.parent.mkdir(parents=True, exist_ok=True)
-    tmp = destino_jpg.with_name(f"{destino_jpg.stem}_tmp{destino_jpg.suffix}")
-    cv2.imwrite(str(tmp), frame)
-    os.replace(tmp, destino_jpg)
+    escrever_imagem_atomica(destino_jpg, frame)
     h, w = frame.shape[:2]
     return w, h

@@ -42,6 +42,16 @@ from config_cameras import (
     salvar_upload_video,
 )
 from zone_editor_component import renderizar_editor_zonas
+from io_atomico import escrever_json_atomico
+from acesso_local import (
+    LimitadorTentativas,
+    encerrar_sessao_admin,
+    iniciar_sessao_admin,
+    pin_configurado,
+    pin_fraco,
+    sessao_admin_ativa,
+    verificar_pin,
+)
 
 CONFIG_MESAS_PATH = Path("data/mesas_config.json")
 CONFIG_REGRAS_PATH = Path("data/regras_config.json")
@@ -96,11 +106,7 @@ def carregar_regras() -> dict:
     }
 
 def salvar_regras(regras: dict):
-    CONFIG_REGRAS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = CONFIG_REGRAS_PATH.with_suffix(".tmp.json")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(regras, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, CONFIG_REGRAS_PATH)
+    escrever_json_atomico(CONFIG_REGRAS_PATH, regras, duravel=True)
 
 def carregar_mesas(mesas_path: Path = CONFIG_MESAS_PATH) -> list:
     if Path(mesas_path).exists():
@@ -131,119 +137,177 @@ def carregar_historico_eventos() -> list:
             pass
     return []
 
+# === CONTROLE DE ACESSO (PIN de administrador) ===
+@st.cache_resource
+def _limitador_pin() -> LimitadorTentativas:
+    """Um limitador por processo do painel: vale para todas as sessões/abas."""
+    return LimitadorTentativas()
+
+
+def _ip_cliente() -> str:
+    """
+    IP do par TCP (o Streamlit não lê X-Forwarded-For, então não é falsificável).
+    No Linux com Docker o IP real da LAN/Tailscale é preservado. Acesso pelo
+    próprio host (127.0.0.1) ou por um proxy futuro cai num balde único:
+    revisar este ponto se for colocado TLS via proxy reverso.
+    """
+    try:
+        return str(st.context.ip_address or "desconhecido")
+    except Exception:
+        return "desconhecido"
+
+
+def _renderizar_login_admin() -> bool:
+    """Bloco de login/logout na barra lateral. Retorna True se a sessão é de administrador."""
+    if sessao_admin_ativa(st.session_state):
+        st.sidebar.success("🔓 Modo administrador")
+        if pin_fraco(pin_configurado()):
+            st.sidebar.warning("PIN fraco (sequência ou dígitos repetidos). Troque `PAINEL_ADMIN_PIN` no `.env`.")
+        if st.sidebar.button("Sair do modo administrador"):
+            encerrar_sessao_admin(st.session_state)
+            st.rerun()
+        return True
+
+    with st.sidebar.form("form_login_admin", clear_on_submit=True):
+        st.markdown("🔒 **Área do administrador**")
+        tentativa = st.text_input("PIN", type="password", max_chars=64)
+        enviar = st.form_submit_button("Entrar")
+    if enviar:
+        ip = _ip_cliente()
+        ok, msg = verificar_pin(tentativa, ip, _limitador_pin(), pin_configurado())
+        # Trilha de auditoria no log do container (nunca registra o PIN digitado)
+        print(f"[acesso] {'sucesso' if ok else 'falha'} de login de administrador de {ip}: {msg}", flush=True)
+        if ok:
+            iniciar_sessao_admin(st.session_state)
+            st.rerun()
+        st.sidebar.error(msg)
+    return False
+
+
+def _aviso_area_restrita(o_que: str):
+    st.info(f"🔒 Área restrita ao administrador: {o_que}. Informe o PIN na barra lateral.")
+
+
 # === BARRA LATERAL (CONFIGURAÇÕES E FILTROS) ===
 st.sidebar.title("⚙️ Painel de Controle")
-st.sidebar.caption("Configurações dos Limites Operacionais")
 
-regras = carregar_regras()
+def _renderizar_regras_sidebar():
+    """Limites operacionais e parâmetros do motor (somente administrador)."""
+    regras = carregar_regras()
 
-novo_limite_espera = st.sidebar.slider(
-    "⏱️ Tempo Limite de Espera (Garçom)",
-    min_value=0.5, max_value=15.0,
-    value=float(regras.get("limite_espera_garcom_minutos", 5.0)),
-    step=0.5,
-    help="Tempo máximo (em minutos) que um cliente pode aguardar atendimento."
-)
-
-novo_limite_cozinha = st.sidebar.slider(
-    "🍳 Tempo Limite de Cozinha / Entrega",
-    min_value=5.0, max_value=45.0,
-    value=float(regras.get("limite_cozinha_minutos", 20.0)),
-    step=1.0,
-    help="Tempo máximo (em minutos) entre pedido e entrega na mesa."
-)
-
-novo_limite_limpeza = st.sidebar.slider(
-    "🧹 Tempo Limite de Limpeza (Giro)",
-    min_value=1.0, max_value=10.0,
-    value=float(regras.get("limite_limpeza_minutos", 3.0)),
-    step=0.5,
-    help="Tempo máximo (em minutos) para higienizar uma mesa vazia."
-)
-
-alerta_sonoro = st.sidebar.checkbox("🔔 Alerta Sonoro no Caixa", value=regras.get("alerta_sonoro", True))
-
-with st.sidebar.expander("👔 Garçom e Limpeza Automática"):
-    deteccao_excedente = st.checkbox(
-        "Detectar garçom por excedente na mesa",
-        value=bool(regras.get("deteccao_garcom_excedente", True)),
-        help="Identifica visita de garçom quando entra mais alguém na mesa acima da base estável.",
-    )
-    visita_min_seg = st.number_input(
-        "Tempo mín. visita de garçom (s)",
-        min_value=1.0, max_value=30.0,
-        value=float(regras.get("visita_min_segundos", 4.0)),
+    novo_limite_espera = st.sidebar.slider(
+        "⏱️ Tempo Limite de Espera (Garçom)",
+        min_value=0.5, max_value=15.0,
+        value=float(regras.get("limite_espera_garcom_minutos", 5.0)),
         step=0.5,
-        help="Filtra passantes rápidos no corredor.",
+        help="Tempo máximo (em minutos) que um cliente pode aguardar atendimento."
     )
-    limpeza_min_seg = st.number_input(
-        "Tempo mín. visita de limpeza (s)",
-        min_value=1.0, max_value=30.0,
-        value=float(regras.get("limpeza_min_segundos", 5.0)),
+
+    novo_limite_cozinha = st.sidebar.slider(
+        "🍳 Tempo Limite de Cozinha / Entrega",
+        min_value=5.0, max_value=45.0,
+        value=float(regras.get("limite_cozinha_minutos", 20.0)),
+        step=1.0,
+        help="Tempo máximo (em minutos) entre pedido e entrega na mesa."
+    )
+
+    novo_limite_limpeza = st.sidebar.slider(
+        "🧹 Tempo Limite de Limpeza (Giro)",
+        min_value=1.0, max_value=10.0,
+        value=float(regras.get("limite_limpeza_minutos", 3.0)),
         step=0.5,
-        help="Tempo breve de higienização na mesa vazia antes de liberá-la.",
-    )
-    uniforme_ativo = st.checkbox(
-        "Reconhecer uniforme da equipe (HSV)",
-        value=bool(regras.get("uniforme_ativo", False)),
-        help="Usa cor da camisa/avental no tórax para distinguir garçons de clientes.",
-    )
-    presets_cores = list(PRESETS_UNIFORME_HSV.keys())
-    cor_atual = str(regras.get("uniforme_cor_preset", "Preto / Escuro"))
-    idx_cor = presets_cores.index(cor_atual) if cor_atual in presets_cores else 0
-    uniforme_cor = st.selectbox("Cor do uniforme / avental", presets_cores, index=idx_cor, disabled=not uniforme_ativo)
-    uniforme_margem = st.slider(
-        "Margem ao redor da mesa (px)",
-        min_value=0, max_value=80,
-        value=int(regras.get("uniforme_margem_px", 35)),
-        step=5,
-        disabled=not uniforme_ativo,
-    )
-    uniforme_ratio = st.slider(
-        "Sensibilidade cor uniforme (%)",
-        min_value=10, max_value=60,
-        value=int(round(float(regras.get("uniforme_ratio_min", 0.25)) * 100)),
-        step=5,
-        disabled=not uniforme_ativo,
-    ) / 100.0
-
-with st.sidebar.expander("📊 Previsão de Giro & Equipe"):
-    permanencia_padrao_min = st.slider(
-        "Permanência padrão inicial (min)",
-        min_value=15.0,
-        max_value=120.0,
-        value=float(regras.get("permanencia_padrao_minutos", 45.0)),
-        step=5.0,
-        help="Usado para prever liberação de mesas antes de completar 3 visitas reais na mesa.",
-    )
-    mesas_por_garcom = st.number_input(
-        "Mesas por garçom (escala)",
-        min_value=1,
-        max_value=12,
-        value=int(regras.get("mesas_por_garcom", 4)),
-        step=1,
-        help="Base usada para recomendar quantidade de garçons nos horários de pico.",
+        help="Tempo máximo (em minutos) para higienizar uma mesa vazia."
     )
 
-if st.sidebar.button("💾 Salvar Alterações"):
-    regras_atualizadas = {
-        **regras,
-        "limite_espera_garcom_minutos": novo_limite_espera,
-        "limite_cozinha_minutos": novo_limite_cozinha,
-        "limite_limpeza_minutos": novo_limite_limpeza,
-        "alerta_sonoro": alerta_sonoro,
-        "deteccao_garcom_excedente": deteccao_excedente,
-        "visita_min_segundos": float(visita_min_seg),
-        "limpeza_min_segundos": float(limpeza_min_seg),
-        "uniforme_ativo": uniforme_ativo,
-        "uniforme_cor_preset": uniforme_cor,
-        "uniforme_margem_px": int(uniforme_margem),
-        "uniforme_ratio_min": float(uniforme_ratio),
-        "permanencia_padrao_minutos": float(permanencia_padrao_min),
-        "mesas_por_garcom": int(mesas_por_garcom),
-    }
-    salvar_regras(regras_atualizadas)
-    st.sidebar.success("Regras atualizadas! O motor aplicará imediatamente.")
+    alerta_sonoro = st.sidebar.checkbox("🔔 Alerta Sonoro no Caixa", value=regras.get("alerta_sonoro", True))
+
+    with st.sidebar.expander("👔 Garçom e Limpeza Automática"):
+        deteccao_excedente = st.checkbox(
+            "Detectar garçom por excedente na mesa",
+            value=bool(regras.get("deteccao_garcom_excedente", True)),
+            help="Identifica visita de garçom quando entra mais alguém na mesa acima da base estável.",
+        )
+        visita_min_seg = st.number_input(
+            "Tempo mín. visita de garçom (s)",
+            min_value=1.0, max_value=30.0,
+            value=float(regras.get("visita_min_segundos", 4.0)),
+            step=0.5,
+            help="Filtra passantes rápidos no corredor.",
+        )
+        limpeza_min_seg = st.number_input(
+            "Tempo mín. visita de limpeza (s)",
+            min_value=1.0, max_value=30.0,
+            value=float(regras.get("limpeza_min_segundos", 5.0)),
+            step=0.5,
+            help="Tempo breve de higienização na mesa vazia antes de liberá-la.",
+        )
+        uniforme_ativo = st.checkbox(
+            "Reconhecer uniforme da equipe (HSV)",
+            value=bool(regras.get("uniforme_ativo", False)),
+            help="Usa cor da camisa/avental no tórax para distinguir garçons de clientes.",
+        )
+        presets_cores = list(PRESETS_UNIFORME_HSV.keys())
+        cor_atual = str(regras.get("uniforme_cor_preset", "Preto / Escuro"))
+        idx_cor = presets_cores.index(cor_atual) if cor_atual in presets_cores else 0
+        uniforme_cor = st.selectbox("Cor do uniforme / avental", presets_cores, index=idx_cor, disabled=not uniforme_ativo)
+        uniforme_margem = st.slider(
+            "Margem ao redor da mesa (px)",
+            min_value=0, max_value=80,
+            value=int(regras.get("uniforme_margem_px", 35)),
+            step=5,
+            disabled=not uniforme_ativo,
+        )
+        uniforme_ratio = st.slider(
+            "Sensibilidade cor uniforme (%)",
+            min_value=10, max_value=60,
+            value=int(round(float(regras.get("uniforme_ratio_min", 0.25)) * 100)),
+            step=5,
+            disabled=not uniforme_ativo,
+        ) / 100.0
+
+    with st.sidebar.expander("📊 Previsão de Giro & Equipe"):
+        permanencia_padrao_min = st.slider(
+            "Permanência padrão inicial (min)",
+            min_value=15.0,
+            max_value=120.0,
+            value=float(regras.get("permanencia_padrao_minutos", 45.0)),
+            step=5.0,
+            help="Usado para prever liberação de mesas antes de completar 3 visitas reais na mesa.",
+        )
+        mesas_por_garcom = st.number_input(
+            "Mesas por garçom (escala)",
+            min_value=1,
+            max_value=12,
+            value=int(regras.get("mesas_por_garcom", 4)),
+            step=1,
+            help="Base usada para recomendar quantidade de garçons nos horários de pico.",
+        )
+
+    if st.sidebar.button("💾 Salvar Alterações"):
+        regras_atualizadas = {
+            **regras,
+            "limite_espera_garcom_minutos": novo_limite_espera,
+            "limite_cozinha_minutos": novo_limite_cozinha,
+            "limite_limpeza_minutos": novo_limite_limpeza,
+            "alerta_sonoro": alerta_sonoro,
+            "deteccao_garcom_excedente": deteccao_excedente,
+            "visita_min_segundos": float(visita_min_seg),
+            "limpeza_min_segundos": float(limpeza_min_seg),
+            "uniforme_ativo": uniforme_ativo,
+            "uniforme_cor_preset": uniforme_cor,
+            "uniforme_margem_px": int(uniforme_margem),
+            "uniforme_ratio_min": float(uniforme_ratio),
+            "permanencia_padrao_minutos": float(permanencia_padrao_min),
+            "mesas_por_garcom": int(mesas_por_garcom),
+        }
+        salvar_regras(regras_atualizadas)
+        st.sidebar.success("Regras atualizadas! O motor aplicará imediatamente.")
+
+
+MODO_ADMIN = _renderizar_login_admin()
+if MODO_ADMIN:
+    st.sidebar.caption("Configurações dos Limites Operacionais")
+    _renderizar_regras_sidebar()
 
 st.sidebar.divider()
 auto_refresh = st.sidebar.toggle("🔄 Atualização em Tempo Real (2s)", value=True)
@@ -288,8 +352,28 @@ def _status_camera_badge(cam_cfg: dict, cam_status: dict) -> str:
     return "🟡 Conectando"
 
 
+def _carregar_cameras_seguro():
+    """
+    Lê as câmeras sem derrubar a página. Se `cameras_config.json` estiver ilegível
+    (e não houver cópia válida em memória), mostra o erro e devolve a última lista
+    válida desta sessão (ou vazia). Retorna (cameras, leitura_ok).
+    Com leitura_ok=False as telas de EDIÇÃO não devem salvar nada: gravar a partir
+    de uma lista incompleta apagaria as câmeras que estão no arquivo.
+    """
+    try:
+        cams = carregar_cameras_config()
+        st.session_state["_cameras_ultima_valida"] = cams
+        return cams, True
+    except ValueError as e:
+        if sessao_admin_ativa(st.session_state, renovar=False):
+            st.error(f"⚠️ Configuração de câmeras ilegível: {e}")
+        else:
+            st.error("⚠️ Configuração de câmeras ilegível. Chame o administrador.")
+        return st.session_state.get("_cameras_ultima_valida", []), False
+
+
 def _obter_cameras_e_estados():
-    cameras_cfg = carregar_cameras_config()
+    cameras_cfg, _ = _carregar_cameras_seguro()
     estado_vivo = carregar_estado_ao_vivo()
     cameras_estado = dict(estado_vivo.get("cameras", {}))
     if not cameras_estado and cameras_cfg and estado_vivo.get("mesas"):
@@ -454,7 +538,9 @@ def renderizar_painel_ao_vivo():
         status_txt = _status_camera_badge(cam, cam_st)
         st.markdown(f"#### 📷 {cam['nome']} — {status_txt}")
         if cam_st.get("erro"):
-            st.warning(f"⚠️ Câmera `{cam['nome']}`: {cam_st['erro']}")
+            # Aba aberta a toda a rede local: mensagem genérica (o texto bruto do erro
+            # pode conter caminho ou URL da fonte). Detalhes na aba Câmeras Ao Vivo (admin).
+            st.warning(f"⚠️ Câmera `{cam['nome']}` com falha de captura. Detalhes na área do administrador.")
         if not mesas_cfg:
             st.info(
                 f"Nenhuma mesa mapeada para **{cam['nome']}**. Acesse a aba **🎨 Editor de Mesas e Zonas** "
@@ -968,7 +1054,9 @@ def _carregar_imagem_base_editor(cam_cfg: dict, preferir_limpo_ao_vivo: bool = T
     elif not preferir_limpo_ao_vivo:
         candidatos = [frame_limpo, frame_vivo]
 
-    if not any(p.exists() for p in candidatos):
+    # Captura automática só para câmera ativa: uma pausada não deve ter a fonte
+    # aberta sem pedido explícito (botão "Capturar da Fonte").
+    if not any(p.exists() for p in candidatos) and cam_cfg.get("ativa", True):
         extrair_frame_limpo_fonte(cam_cfg["fonte"], frame_limpo)
 
     for caminho in candidatos:
@@ -999,7 +1087,10 @@ def renderizar_editor_navegador():
         else:
             st.error(msg)
 
-    cameras_cfg = carregar_cameras_config()
+    cameras_cfg, leitura_ok = _carregar_cameras_seguro()
+    if not leitura_ok or not cameras_cfg:
+        st.info("Editor indisponível até o arquivo de câmeras ser corrigido.")
+        return
     mapa_nomes = {c["id"]: f"📷 {c['nome']} ({c['id']})" for c in cameras_cfg}
     cam_id_sel = st.selectbox(
         "Câmera para calibrar zonas:",
@@ -1180,7 +1271,10 @@ def renderizar_aba_cameras():
         else:
             st.error(msg)
 
-    cameras_cfg = carregar_cameras_config()
+    cameras_cfg, leitura_ok = _carregar_cameras_seguro()
+    if not leitura_ok:
+        st.info("Cadastro de câmeras bloqueado para não sobrescrever o arquivo ilegível. Corrija ou restaure `data/cameras_config.json`.")
+        return
     videos_disponiveis = listar_videos_disponiveis()
 
     for idx, cam in enumerate(cameras_cfg):
@@ -1304,25 +1398,42 @@ with aba_visao_geral:
     if auto_refresh:
         @st.fragment(run_every=2)
         def frag_visao_geral():
+            # Sessão de administrador expirou com a página parada: recarrega a página
+            # inteira para esconder barra lateral, editor e câmeras (não só bloquear ações).
+            if MODO_ADMIN and not sessao_admin_ativa(st.session_state, renovar=False):
+                st.rerun(scope="app")
             renderizar_painel_ao_vivo()
         frag_visao_geral()
     else:
         renderizar_painel_ao_vivo()
 
 with aba_camera:
-    if auto_refresh:
+    if not MODO_ADMIN:
+        _aviso_area_restrita("visualização das câmeras (imagens de clientes)")
+    elif auto_refresh:
         @st.fragment(run_every=2)
         def frag_camera():
+            # A atualização automática não renova a sessão: aba esquecida aberta expira
+            if not sessao_admin_ativa(st.session_state, renovar=False):
+                _aviso_area_restrita("visualização das câmeras (imagens de clientes)")
+                return
             renderizar_camera_ao_vivo()
         frag_camera()
     else:
         renderizar_camera_ao_vivo()
 
 with aba_relatorios:
-    @st.fragment
-    def frag_relatorios():
-        renderizar_relatorios_etapa2()
-    frag_relatorios()
+    if not MODO_ADMIN:
+        _aviso_area_restrita("relatórios gerenciais")
+    else:
+        @st.fragment
+        def frag_relatorios():
+            # Interações dentro do fragmento não reexecutam o controle de acesso da página
+            if not sessao_admin_ativa(st.session_state, renovar=False):
+                _aviso_area_restrita("relatórios gerenciais")
+                return
+            renderizar_relatorios_etapa2()
+        frag_relatorios()
 
 with aba_historico:
     if auto_refresh:
@@ -1334,7 +1445,13 @@ with aba_historico:
         renderizar_historico()
 
 with aba_editor:
-    renderizar_editor_navegador()
+    if MODO_ADMIN:
+        renderizar_editor_navegador()
+    else:
+        _aviso_area_restrita("editor de mesas")
 
 with aba_cameras:
-    renderizar_aba_cameras()
+    if MODO_ADMIN:
+        renderizar_aba_cameras()
+    else:
+        _aviso_area_restrita("cadastro de câmeras")
