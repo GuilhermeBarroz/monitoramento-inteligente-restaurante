@@ -1,6 +1,8 @@
 -- Esquema central multi-tenant do portal em nuvem.
--- Todos os dados analíticos carregam `estabelecimento_id`; a chave (estabelecimento_id, origem_id)
--- torna a ingestão idempotente (reenvios do Edge Sync não duplicam registros).
+-- Todos os dados analíticos carregam `estabelecimento_id`. A chave
+-- (estabelecimento_id, instalacao_id, origem_id) torna a ingestão idempotente (reenvios do
+-- Edge Sync não duplicam registros) e distingue um banco local recriado, cujos ids recomeçam
+-- do 1, dos registros antigos (antes eram descartados em silêncio pelo ON CONFLICT).
 
 CREATE TABLE IF NOT EXISTS estabelecimentos (
     id              SERIAL PRIMARY KEY,
@@ -23,6 +25,7 @@ CREATE TABLE IF NOT EXISTS usuarios (
 
 CREATE TABLE IF NOT EXISTS eventos_mesas (
     estabelecimento_id INTEGER NOT NULL REFERENCES estabelecimentos(id) ON DELETE CASCADE,
+    instalacao_id      UUID NOT NULL,
     origem_id          BIGINT NOT NULL,
     epoch              DOUBLE PRECISION NOT NULL,
     iso_datahora       TEXT NOT NULL,
@@ -34,12 +37,13 @@ CREATE TABLE IF NOT EXISTS eventos_mesas (
     tipo_evento        TEXT NOT NULL,
     detalhes           JSONB NOT NULL DEFAULT '{}'::jsonb,
     recebido_em        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (estabelecimento_id, origem_id)
+    PRIMARY KEY (estabelecimento_id, instalacao_id, origem_id)
 );
 CREATE INDEX IF NOT EXISTS idx_eventos_est_epoch ON eventos_mesas (estabelecimento_id, epoch);
 
 CREATE TABLE IF NOT EXISTS visitas_concluidas (
     estabelecimento_id     INTEGER NOT NULL REFERENCES estabelecimentos(id) ON DELETE CASCADE,
+    instalacao_id          UUID NOT NULL,
     origem_id              BIGINT NOT NULL,
     camera_id              TEXT NOT NULL,
     camera_nome            TEXT NOT NULL,
@@ -54,12 +58,13 @@ CREATE TABLE IF NOT EXISTS visitas_concluidas (
     qtd_pessoas            INTEGER NOT NULL,
     houve_alerta           BOOLEAN NOT NULL,
     recebido_em            TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (estabelecimento_id, origem_id)
+    PRIMARY KEY (estabelecimento_id, instalacao_id, origem_id)
 );
 CREATE INDEX IF NOT EXISTS idx_visitas_est_fim ON visitas_concluidas (estabelecimento_id, fim_epoch);
 
 CREATE TABLE IF NOT EXISTS amostras_ocupacao (
     estabelecimento_id INTEGER NOT NULL REFERENCES estabelecimentos(id) ON DELETE CASCADE,
+    instalacao_id      UUID NOT NULL,
     origem_id          BIGINT NOT NULL,
     epoch              DOUBLE PRECISION NOT NULL,
     dia_semana         SMALLINT NOT NULL,
@@ -71,6 +76,6 @@ CREATE TABLE IF NOT EXISTS amostras_ocupacao (
     pessoas_sentadas   INTEGER NOT NULL,
     alertas_ativos     INTEGER NOT NULL,
     recebido_em        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (estabelecimento_id, origem_id)
+    PRIMARY KEY (estabelecimento_id, instalacao_id, origem_id)
 );
 CREATE INDEX IF NOT EXISTS idx_amostras_est_epoch ON amostras_ocupacao (estabelecimento_id, epoch);

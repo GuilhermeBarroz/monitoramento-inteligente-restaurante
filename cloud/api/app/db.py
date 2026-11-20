@@ -18,7 +18,18 @@ def obter_pool() -> ConnectionPool:
         dsn = os.environ.get("DATABASE_URL", "").strip()
         if not dsn:
             raise RuntimeError("DATABASE_URL não configurada.")
-        _pool = ConnectionPool(dsn, min_size=1, max_size=int(os.environ.get("DB_POOL_MAX", "10")), open=True)
+        _pool = ConnectionPool(
+            dsn,
+            min_size=1,
+            max_size=int(os.environ.get("DB_POOL_MAX", "10")),
+            # Valida a conexão antes de entregar (após reinício do Postgres, conexões
+            # mortas no pool geravam 500 até serem substituídas).
+            check=ConnectionPool.check_connection,
+            # Pool esgotado: falha rápido (a API devolve 503) em vez de prender a requisição 30 s.
+            timeout=float(os.environ.get("DB_POOL_TIMEOUT_SEG", "5")),
+            max_lifetime=3600.0,
+            open=True,
+        )
     return _pool
 
 

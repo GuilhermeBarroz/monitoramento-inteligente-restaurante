@@ -6,7 +6,11 @@ from typing import Annotated, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 LOTE_MAX = 1000
-Texto = Annotated[str, Field(min_length=1, max_length=120)]
+# O caractere NUL não é aceito pelo Postgres (TEXT/JSONB): recusado aqui com 422, para o
+# Edge Sync isolar o registro, em vez de virar erro 500 reenviado para sempre.
+SEM_NUL = r"^[^\x00]*$"
+Texto = Annotated[str, Field(min_length=1, max_length=120, pattern=SEM_NUL)]
+InstalacaoId = Annotated[str, Field(pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")]
 Epoch = Annotated[float, Field(ge=1_000_000_000, le=10_000_000_000)]  # ~2001 a ~2286
 DiaSemana = Annotated[int, Field(ge=0, le=6)]
 Hora = Annotated[int, Field(ge=0, le=23)]
@@ -28,21 +32,28 @@ class EventoMesa(_Base):
     camera_id: Texto
     camera_nome: Texto
     mesa_id: Texto
-    tipo_evento: Annotated[str, Field(min_length=1, max_length=60)]
-    detalhes_json: Optional[Annotated[str, Field(max_length=8000)]] = None
+    tipo_evento: Annotated[str, Field(min_length=1, max_length=60, pattern=SEM_NUL)]
+    # validate_default: sem o campo, o default None também passa pelo validador e vira "{}"
+    # (antes inseria NULL numa coluna NOT NULL → erro 500).
+    detalhes_json: Optional[str] = Field(default=None, max_length=8000, validate_default=True)
 
-    @field_validator("detalhes_json")
+    @field_validator("detalhes_json", mode="before")
     @classmethod
     def _json_objeto(cls, valor: Optional[str]) -> str:
-        if valor is None or not valor.strip():
+        if valor is None or (isinstance(valor, str) and not valor.strip()):
             return "{}"
+        if not isinstance(valor, str):
+            raise ValueError("detalhes_json deve ser texto JSON")
         try:
             dados = json.loads(valor)
         except ValueError as exc:
             raise ValueError("detalhes_json não é JSON válido") from exc
         if not isinstance(dados, dict):
             raise ValueError("detalhes_json deve ser um objeto JSON")
-        return json.dumps(dados, ensure_ascii=False)
+        normalizado = json.dumps(dados, ensure_ascii=False)
+        if "\x00" in normalizado or "\\u0000" in normalizado:
+            raise ValueError("detalhes_json contém caractere NUL")
+        return normalizado
 
 
 class VisitaConcluida(_Base):
@@ -85,12 +96,15 @@ class _LoteBase(_Base):
 
 
 class LoteEventos(_LoteBase):
+    instalacao_id: InstalacaoId
     registros: Annotated[List[EventoMesa], Field(min_length=1, max_length=LOTE_MAX)]
 
 
 class LoteVisitas(_LoteBase):
+    instalacao_id: InstalacaoId
     registros: Annotated[List[VisitaConcluida], Field(min_length=1, max_length=LOTE_MAX)]
 
 
 class LoteAmostras(_LoteBase):
+    instalacao_id: InstalacaoId
     registros: Annotated[List[AmostraOcupacao], Field(min_length=1, max_length=LOTE_MAX)]

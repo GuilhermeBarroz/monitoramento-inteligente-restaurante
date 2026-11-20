@@ -14,6 +14,7 @@ import sqlite3
 import statistics
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
 import zoneinfo
 
 DB_PATH_PADRAO = Path("data/historico_salao.db")
@@ -256,6 +257,19 @@ class RepositorioAnalytics:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_amostras_epoch ON amostras_ocupacao (epoch)")
+            # Identidade desta instalação do banco. Se o arquivo for apagado e recriado,
+            # nasce um id novo: o edge-sync detecta e a nuvem não confunde os ids
+            # reiniciados (1, 2, 3...) com registros antigos.
+            conn.execute("CREATE TABLE IF NOT EXISTS meta (chave TEXT PRIMARY KEY, valor TEXT NOT NULL)")
+            conn.execute(
+                "INSERT OR IGNORE INTO meta (chave, valor) VALUES (?, ?)",
+                ("instalacao_id", str(uuid.uuid4())),
+            )
+
+    def obter_instalacao_id(self) -> str:
+        with self._conectar() as conn:
+            linha = conn.execute("SELECT valor FROM meta WHERE chave = ?", ("instalacao_id",)).fetchone()
+        return str(linha["valor"])
 
     @staticmethod
     def _clausula_filtro(

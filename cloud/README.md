@@ -34,8 +34,9 @@ Depois rode `docker compose up -d` no Mini PC. Acompanhe com `docker compose log
 ## 3. Outros comandos de administração
 ```bash
 docker compose exec api python -m app.admin listar                 # restaurantes, último sync e usuários
-docker compose exec api python -m app.admin novo-token 3           # rotaciona token (o antigo para de valer)
+docker compose exec api python -m app.admin novo-token 3           # rotaciona token (o antigo para de valer; não reativa)
 docker compose exec api python -m app.admin desativar 3            # bloqueia a ingestão do restaurante
+docker compose exec api python -m app.admin reativar 3             # volta a aceitar a ingestão
 docker compose exec api python -m app.admin adicionar-usuario dono@gmail.com gerente --estabelecimento 3
 docker compose exec api python -m app.admin adicionar-usuario voce@gmail.com admin
 docker compose exec api python -m app.admin remover-usuario dono@gmail.com
@@ -45,12 +46,17 @@ docker compose exec api python -m app.admin remover-usuario dono@gmail.com
 * O `estabelecimento_id` sai sempre do token no servidor e nunca do payload. Campos extras são rejeitados com `422`.
 * Payloads são validados com Pydantic: tipos, faixas e tamanho de lote ≤ 1000. O corpo da requisição é limitado a 5 MB, no Traefik e na API.
 * Todo o SQL é parametrizado com psycopg. O Postgres não publica nenhuma porta.
-* A ingestão é idempotente, com chave `(estabelecimento_id, origem_id)`, então reenvios não duplicam dados.
+* A ingestão é idempotente, com chave `(estabelecimento_id, instalacao_id, origem_id)`, então reenvios não duplicam dados. A resposta informa `recebidos` e `inseridos` (novos).
+* Registros recusados (`422`) são isolados pelo Edge Sync e postos em quarentena (`data/sync_estado.json`) sem travar o restante. O caractere NUL é recusado na validação.
+* Pool de conexões esgotado responde `503` (o Edge tenta de novo com backoff).
 
 ## Backup do banco
 ```bash
 docker compose exec postgres pg_dump -U monitor monitor_mesas | gzip > backup_$(date +%F).sql.gz
 ```
 
-## Limitação conhecida
-Se o `data/historico_salao.db` de um restaurante for apagado e recriado, os IDs locais recomeçam do 1, e a nuvem ignora esses registros porque já existem. Nesse caso, gere um novo estabelecimento (ou limpe os dados dele) antes de reconectar o Edge.
+## Banco local recriado
+Cada SQLite do restaurante tem um `instalacao_id` (UUID). Se o `data/historico_salao.db` for apagado e recriado, o Edge Sync detecta a nova instalação, recomeça o envio do zero e a nuvem guarda o novo histórico sob a nova instalação, sem descartar nada.
+
+## Mudança de esquema (20/11/2026)
+As tabelas analíticas ganharam a coluna `instalacao_id` na chave primária. O `schema.sql` usa `CREATE TABLE IF NOT EXISTS` e **não altera tabelas já existentes**: se você subiu um ambiente de teste antes desta data, recrie o banco (`docker compose down -v` apaga o volume do Postgres) antes de reconectar os Edges.

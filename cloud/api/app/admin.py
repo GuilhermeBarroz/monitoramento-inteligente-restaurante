@@ -5,6 +5,7 @@ CLI de administração da nuvem (executar dentro do container da API).
     docker compose exec api python -m app.admin listar
     docker compose exec api python -m app.admin novo-token 3
     docker compose exec api python -m app.admin desativar 3
+    docker compose exec api python -m app.admin reativar 3
     docker compose exec api python -m app.admin adicionar-usuario dono@gmail.com gerente --estabelecimento 3
     docker compose exec api python -m app.admin adicionar-usuario voce@gmail.com admin
 
@@ -36,6 +37,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("novo-token")
     p.add_argument("id", type=int)
     p = sub.add_parser("desativar")
+    p.add_argument("id", type=int)
+    p = sub.add_parser("reativar")
     p.add_argument("id", type=int)
     p = sub.add_parser("adicionar-usuario")
     p.add_argument("email")
@@ -76,18 +79,25 @@ def main(argv=None) -> int:
 
         elif args.comando == "novo-token":
             token = db.gerar_token()
+            # Trocar o token NÃO reativa um estabelecimento desativado (use `reativar`).
             linha = conn.execute(
-                "UPDATE estabelecimentos SET token_hash = %s, ativo = TRUE WHERE id = %s RETURNING nome",
+                "UPDATE estabelecimentos SET token_hash = %s WHERE id = %s RETURNING nome, ativo",
                 (db.hash_token(token), args.id),
             ).fetchone()
             if linha is None:
                 print("Estabelecimento não encontrado.", file=sys.stderr)
                 return 1
             _exibir_token(args.id, linha[0], token)
+            if not linha[1]:
+                print("Atenção: o estabelecimento está DESATIVADO; o novo token só funciona após `reativar`.")
 
         elif args.comando == "desativar":
             n = conn.execute("UPDATE estabelecimentos SET ativo = FALSE WHERE id = %s", (args.id,)).rowcount
             print("Desativado." if n else "Estabelecimento não encontrado.")
+
+        elif args.comando == "reativar":
+            n = conn.execute("UPDATE estabelecimentos SET ativo = TRUE WHERE id = %s", (args.id,)).rowcount
+            print("Reativado." if n else "Estabelecimento não encontrado.")
 
         elif args.comando == "adicionar-usuario":
             email = args.email.strip().lower()
