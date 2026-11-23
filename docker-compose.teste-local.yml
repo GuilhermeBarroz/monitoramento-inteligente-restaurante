@@ -1,0 +1,49 @@
+# ==============================================================================
+# Override do EDGE para o TESTE LOCAL ponta a ponta (não usar no Mini PC real).
+#
+# Aplica-se por cima do docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.teste-local.yml --env-file .env.teste-local up -d --build
+#
+# O que muda em relação à operação real:
+#   - nome de projeto próprio (não reaproveita containers da stack normal);
+#   - todos os serviços usam ./data-teste (CÓPIA de ./data), preservando o
+#     histórico e o cursor de sync reais;
+#   - painel publicado só em 127.0.0.1:8501;
+#   - edge-sync aceita http:// e envia para a nuvem local em
+#     http://host.docker.internal:8000 (cloud/docker-compose.teste-local.yml).
+#
+# Roteiro completo: cloud/TESTE_LOCAL.md
+# ==============================================================================
+
+name: monitor-teste-edge
+
+services:
+  # restart "no": no teste, nada religa sozinho quando o Docker Desktop abre
+  dashboard:
+    container_name: monitor-teste-dashboard
+    restart: "no"
+    ports: !override
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ./data-teste:/app/data
+
+  motor-estados:
+    container_name: monitor-teste-engine
+    restart: "no"
+    volumes:
+      - ./data-teste:/app/data
+
+  edge-sync:
+    container_name: monitor-teste-edge-sync
+    restart: "no"
+    volumes:
+      - ./data-teste:/app/data
+    environment:
+      - CLOUD_API_URL=http://host.docker.internal:8000
+      - CLOUD_PERMITIR_HTTP=1
+      - SYNC_INTERVALO_SEG=${SYNC_INTERVALO_SEG:-30}
+    extra_hosts:
+      # Validado só no Docker Desktop (Windows/macOS), que já resolve este nome.
+      # Em Linux nativo, a API publicada em 127.0.0.1 NÃO é alcançável pelo
+      # host-gateway: lá seria preciso publicar a API no IP do docker0.
+      - "host.docker.internal:host-gateway"

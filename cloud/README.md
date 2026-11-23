@@ -7,6 +7,8 @@ Restaurante (edge-sync) ──HTTPS + token──▶ Traefik ──▶ api (Fast
 Dono / gerente (navegador) ──HTTPS + Google──▶ Traefik ──▶ portal (Streamlit) ──▶ postgres (somente leitura)
 ```
 
+> 🧪 Para testar tudo no PC antes da VPS (edge com vídeo de exemplo + nuvem local, sem Traefik), siga [TESTE_LOCAL.md](TESTE_LOCAL.md).
+
 ## Pré-requisitos
 * VPS com Docker e **Traefik já em execução**, ligado a uma rede Docker externa (padrão: `traefik`).
 * Registro DNS `A` do domínio da API (ex: `api.seudominio.com.br`) apontando para a VPS.

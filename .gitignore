@@ -11,6 +11,9 @@
 **/.env
 **/.env.*
 !**/.env.example
+# Modelos versionados (ex.: .env.teste-local.example) — sem valores reais
+!.env.*.example
+!**/.env.*.example
 .streamlit/secrets.toml
 **/secrets.toml
 *.pem
@@ -27,6 +30,8 @@ service-account*.json
 # logs de alertas, estado ao vivo e cursor do Edge Sync.
 data/*
 !data/.gitkeep
+# Cópia de data/ usada no teste local ponta a ponta (docker-compose.teste-local.yml)
+data-teste/
 
 # Bancos SQLite em qualquer lugar (inclui arquivos WAL/SHM)
 *.db

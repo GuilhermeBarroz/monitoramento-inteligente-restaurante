@@ -6,6 +6,7 @@
 
 # Dados de operação, segredos e banco
 data/
+data-teste/
 .env
 .env.*
 **/secrets.toml

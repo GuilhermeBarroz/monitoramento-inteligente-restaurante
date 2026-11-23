@@ -1,0 +1,88 @@
+# ==============================================================================
+# Nuvem em TESTE LOCAL (PC do desenvolvedor) - postgres + api + portal, SEM Traefik
+#
+# Mesmas imagens da VPS (./api e ./portal), mas:
+#   - sem labels/rede do Traefik (acesso direto por localhost, sem HTTPS);
+#   - portas publicadas SOMENTE em 127.0.0.1 (nada fica exposto na rede local);
+#   - nome de projeto, containers e volume próprios: não conflita com a stack
+#     do edge (raiz do repositório) nem com a da VPS.
+#
+# Uso (dentro de cloud/):
+#   copie .env.teste-local.example para .env.teste-local e preencha
+#   docker compose -f docker-compose.teste-local.yml --env-file .env.teste-local up -d --build postgres api
+#
+# API:    http://localhost:8000/health
+# Portal: http://localhost:8502   (redirect OAuth: http://localhost:8502/oauth2callback)
+#
+# Roteiro completo: cloud/TESTE_LOCAL.md
+# Apagar tudo (inclusive o banco de teste): ... down -v
+# ==============================================================================
+
+name: monitor-teste-local
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: monitor-teste-postgres
+    # Teste: não religa sozinho quando o Docker Desktop abre
+    restart: "no"
+    environment:
+      POSTGRES_DB: monitor_mesas
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env.teste-local}
+      TZ: America/Sao_Paulo
+    volumes:
+      - pgdata-teste:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor -d monitor_mesas"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Sem porta publicada, como na VPS. Para inspecionar:
+    #   docker compose -f docker-compose.teste-local.yml exec postgres psql -U monitor monitor_mesas
+    networks:
+      - interna
+
+  api:
+    build: ./api
+    container_name: monitor-teste-api
+    # Teste: não religa sozinho quando o Docker Desktop abre
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://monitor:${POSTGRES_PASSWORD}@postgres:5432/monitor_mesas
+      TZ: America/Sao_Paulo
+    ports:
+      # O edge (outra stack Docker) chega aqui por http://host.docker.internal:8000
+      - "127.0.0.1:8000:8000"
+    networks:
+      - interna
+
+  portal:
+    build: ./portal
+    container_name: monitor-teste-portal
+    # Teste: não religa sozinho quando o Docker Desktop abre
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORTAL_DATABASE_URL: postgresql://${PORTAL_DB_USER:-portal}:${PORTAL_DB_PASSWORD:-}@postgres:5432/monitor_mesas
+      # http só é aceito para localhost (validado em app/configurar_auth.py)
+      PORTAL_URL: http://localhost:8502
+      PORTAL_COOKIE_SECRET: ${PORTAL_COOKIE_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      TZ: America/Sao_Paulo
+    ports:
+      - "127.0.0.1:8502:8501"
+    networks:
+      - interna
+
+volumes:
+  pgdata-teste:
+
+networks:
+  interna:
